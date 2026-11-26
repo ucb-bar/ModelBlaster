@@ -34,8 +34,8 @@ def test_backend_is_rvv_k3_plus_x100_kernels():
     assert x.kernel_cflags == k3.kernel_cflags
     assert any(f == "-march=rv64gcv_zvl256b_zfh_zvfh" for f in x.kernel_cflags)
     assert not any("zvl1024b" in f for f in x.kernel_cflags)   # must be legal on the X100
-    assert x.curated_aliases == ("rvv_k3", "rvv")
-    assert backend_lineage("ime_k3_x100") == ("ime_k3_x100", "rvv_k3", "rvv")
+    assert x.curated_aliases == ("rvv_k3", "rvv", "rvv_f16")
+    assert backend_lineage("ime_k3_x100") == ("ime_k3_x100", "rvv_k3", "rvv", "rvv_f16")
     assert x.verify_method == k3.verify_method
 
 

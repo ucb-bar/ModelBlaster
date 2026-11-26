@@ -269,7 +269,7 @@ IME_K3_A100 = Backend(
     prj_conf_overlay=RVV_K3_A100.prj_conf_overlay,
     spike_args=RVV_K3_A100.spike_args,
     optimization_guide=RVV_K3_A100.optimization_guide,
-    curated_aliases=("rvv_k3_a100", "rvv"),
+    curated_aliases=("rvv_k3_a100", "rvv", "rvv_f16"),   # rvv_f16: see ime_k3_x100
     verify_method=RVV_K3_A100.verify_method,
 )
 
@@ -293,7 +293,9 @@ IME_K3_X100 = Backend(
     prj_conf_overlay=RVV_K3.prj_conf_overlay,
     spike_args=RVV_K3.spike_args,
     optimization_guide=RVV_K3.optimization_guide,
-    curated_aliases=("rvv_k3", "rvv"),
+    # rvv_f16 too: lineage is not transitive, and without it every fp16 island op of a mixed model
+    # (ViNT) fell back to the scalar reference (conv2d_f16 279 ms of 431 on X100 cpu 0).
+    curated_aliases=("rvv_k3", "rvv", "rvv_f16"),
     verify_method=RVV_K3.verify_method,
 )
 
