@@ -545,7 +545,7 @@ def deploy_and_run(cfg, elf, cpu, cpu_type, reps, lock):
         try:
             proc = subprocess.run(
                 ["ssh", *opts, cfg.host,
-                 f"taskset -c {mask} {rbin} {cpu} {reps}"],
+                 (("flock " + os.environ["MODELBLASTER_BOARD_FLOCK"] + " ") if os.environ.get("MODELBLASTER_BOARD_FLOCK") else "") + f"taskset -c {mask} {rbin} {cpu} {reps}"],
                 capture_output=True, text=True)
         finally:
             subprocess.run(["ssh", *opts, cfg.host, f"rm -f {rbin}"],
