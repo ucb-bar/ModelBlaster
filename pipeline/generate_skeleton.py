@@ -2147,6 +2147,13 @@ def shard_conv_weights(
         oc = int(_conv_shape_of(op).get("OC", 0))
         if did is None or f <= 1 or oc <= 0 or oc % f != 0:
             continue
+        # The op's OWN weight layout decides, not the backend's: conv2d_f16 stays OIHW on
+        # every backend (its OC slice is a pointer offset), and its dispatch is emitted as
+        # one full-OC call that names the parent array. Planning shard arrays for it dropped
+        # that parent -- ViNT's pool builds on ime_k3_a100 failed with an undeclared
+        # `<conv>_weights_ime_k3_a100` for its fp16 convs.
+        if _conv_weight_layout_for_op(op.get("op"), backend) in (None, "oihw"):
+            continue
         # Split by output rows instead (row_split_convs): no per-shard weights.
         if conv_split.split_axis(op.get("op"), _conv_shape_of(op), f, backend) == "row":
             continue
