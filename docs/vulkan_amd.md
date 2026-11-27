@@ -409,7 +409,7 @@ roundings, which the layers amplify; bit-identical end to end is not expected, a
 golden bound says). Bit-exactness: the walker gates on the Deck (int8 IRs
 of all three graphs): every quantize_rows_s8 / linear_dq_s8 / linear3_dq_s8 / linear_dq_add_s8
 equal to the reference C (0 mismatches), every fp32 op within its slot bound, replay equal; the
-Vulkan test file on the Deck (RADV) and on garden's NVIDIA TITAN RTX (Vulkan): all int8 kernels
+Vulkan test file on the Deck (RADV) and on an NVIDIA TITAN RTX (Vulkan): all int8 kernels
 bit-exact against the reference C on every path (skinny + split-K, dot4 tiles, scalar);
 the CPU rules equal the reference C (test_int8_mixed).
 

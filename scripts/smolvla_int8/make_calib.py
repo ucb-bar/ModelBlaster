@@ -2,7 +2,7 @@
 calibration observations' frames at other brightnesses, plus HM01B0 frames from the PULP-DroNet v3 set
 that are NOT in the held-out set (make_heldout.py samples with seed 11; this samples others).
    python make_calib.py OUT_DIR HELDOUT_DIR [--n-himax 16]"""
-import argparse, glob, random, torch, numpy as np
+import argparse, glob, os, random, torch, numpy as np
 from pathlib import Path
 from PIL import Image, ImageEnhance
 torch.set_num_threads(8)
@@ -10,8 +10,10 @@ from modelblaster.models import smolvla_split as S
 from lerobot.policies.factory import make_pre_post_processors
 ap = argparse.ArgumentParser()
 ap.add_argument("out"); ap.add_argument("heldout")
-ap.add_argument("--frames", default="/scratch/dima/claude_mb/frames")
-ap.add_argument("--himax", default="/scratch2/dima/misc_sw/XPU-RT/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3")
+ap.add_argument("--frames", default=os.environ.get("MB_SMOLVLA_FRAMES"), required="MB_SMOLVLA_FRAMES" not in os.environ,
+                help="calibration frames directory (or MB_SMOLVLA_FRAMES)")
+ap.add_argument("--himax", default=os.environ.get("MB_HIMAX_DATASET"), required="MB_HIMAX_DATASET" not in os.environ,
+                help="PULP-DroNet v3 HM01B0 dataset root (or MB_HIMAX_DATASET)")
 ap.add_argument("--n-himax", type=int, default=16)
 a = ap.parse_args()
 out = Path(a.out); out.mkdir(parents=True, exist_ok=True)

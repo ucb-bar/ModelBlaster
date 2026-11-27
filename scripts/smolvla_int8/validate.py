@@ -1,6 +1,6 @@
 """int8 SmolVLA numerics validation on the CPU reference walk (int8 kinds bit-exact with the reference C,
 fp32 ops as walk_torch): action-space metrics over a held-out set, per-layer error attribution,
-accumulator / saturation headroom. Run where the fp32 IRs and calibration samples live (garden).
+accumulator / saturation headroom. Run where the fp32 IRs and calibration samples live.
 
   python validate.py metrics  OUT.jsonl COMBOS_JSON [--save DIR]      per-observation action metrics
   python validate.py local    OUT.json  POLICY_JSON  [--n 16]          per-linear local error + headroom
@@ -8,8 +8,9 @@ accumulator / saturation headroom. Run where the fp32 IRs and calibration sample
   python validate.py irs      OUT.jsonl IR_ROOT TAG [--save DIR]      extracted IRs (ROOT/{vision,prefix,step}) as they are
 COMBOS: [[tag, {part: policy | null (fp32)}], ...]   (a part missing from a combo: its policy is "linear")
 GROUPS: [[tag, {part: [fnmatch patterns kept fp32 on top of the policy]}], ...]
-Common: --root (fp32 IRs: ROOT/{vision,prefix,step}), --cal (dir with cal_{part}.pt), --obs (glob, repeatable)."""
-import argparse, copy, fnmatch, glob, json, math, sys, time
+Common: --root (fp32 IRs: ROOT/{vision,prefix,step}; or MB_SMOLVLA_IR_ROOT), --cal (dir with cal_{part}.pt and the
+default observation sets obs/, obs14/, heldout/; or MB_SMOLVLA_CAL), --obs (glob, repeatable)."""
+import argparse, copy, fnmatch, glob, json, math, os, sys, time
 import numpy as np, torch
 from modelblaster.pipeline import int8_mixed as M
 M._walk_torch()
@@ -18,8 +19,8 @@ from mbir import load_ir
 PARTS = ("vision", "prefix", "step")
 ap = argparse.ArgumentParser()
 ap.add_argument("mode"); ap.add_argument("out"); ap.add_argument("arg1"); ap.add_argument("arg2", nargs="?")
-ap.add_argument("--root", default="/scratch/dima/claude_mb/r14f")
-ap.add_argument("--cal", default="/scratch/dima/claude_mb")
+ap.add_argument("--root", default=os.environ.get("MB_SMOLVLA_IR_ROOT"), required="MB_SMOLVLA_IR_ROOT" not in os.environ)
+ap.add_argument("--cal", default=os.environ.get("MB_SMOLVLA_CAL"), required="MB_SMOLVLA_CAL" not in os.environ)
 ap.add_argument("--obs", action="append")
 ap.add_argument("--n", type=int, default=0)
 ap.add_argument("--save")
@@ -30,8 +31,7 @@ torch.set_num_threads(a.threads)
 f32 = {p: load_ir(f"{a.root}/{p}") for p in PARTS}
 cal = {p: [M.inputs_of(f32[p], s) for s in torch.load(f"{a.cal}/cal_{p}.pt")] for p in PARTS}
 obs_files = []
-for g in (a.obs or ["/scratch/dima/claude_mb/obs/eval0.pt", "/scratch/dima/claude_mb/obs14/*.pt",
-                    "/scratch/dima/claude_mb/heldout/*.pt"]):
+for g in (a.obs or [f"{a.cal}/obs/eval0.pt", f"{a.cal}/obs14/*.pt", f"{a.cal}/heldout/*.pt"]):
     obs_files += sorted(glob.glob(g))
 if a.n:
     obs_files = obs_files[:a.n]

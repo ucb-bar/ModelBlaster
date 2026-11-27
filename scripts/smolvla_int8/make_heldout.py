@@ -4,7 +4,7 @@ are extracted for one prompt length). Images: the riskybird frames NOT used for 
 augmentations of them, real HM01B0 frames from the PULP-DroNet v3 set (grayscale, other drones),
 and synthetic scenes.
    python make_heldout.py OUT_DIR [--frames DIR] [--himax DIR] [--n-himax 120] [--L 14]"""
-import argparse, glob, random, sys, torch, numpy as np
+import argparse, glob, os, random, sys, torch, numpy as np
 from pathlib import Path
 from PIL import Image, ImageOps, ImageEnhance
 torch.set_num_threads(8)
@@ -13,8 +13,10 @@ from lerobot.policies.factory import make_pre_post_processors
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
-ap.add_argument("--frames", default="/scratch/dima/claude_mb/frames")
-ap.add_argument("--himax", default="/scratch2/dima/misc_sw/XPU-RT/datasets/pulp_dronet_himax/raw/Dataset_PULP_Dronet_v3")
+ap.add_argument("--frames", default=os.environ.get("MB_SMOLVLA_FRAMES"), required="MB_SMOLVLA_FRAMES" not in os.environ,
+                help="calibration frames directory (or MB_SMOLVLA_FRAMES)")
+ap.add_argument("--himax", default=os.environ.get("MB_HIMAX_DATASET"), required="MB_HIMAX_DATASET" not in os.environ,
+                help="PULP-DroNet v3 HM01B0 dataset root (or MB_HIMAX_DATASET)")
 ap.add_argument("--n-himax", type=int, default=120)
 ap.add_argument("--L", type=int, default=14)
 ap.add_argument("--seed0", type=int, default=1000)

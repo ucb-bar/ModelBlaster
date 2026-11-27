@@ -4,7 +4,7 @@
   "sub_project":       "vcu118",
   "snapshot_ts":       "2026-05-18T17:43:32-07:00",
   "chipyard_sha":      "48f904ae",
-  "src_header":        "/scratch2/dima/misc_sw/FreshScheduler/hw/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/gemmini_params_q31.h",
+  "src_header":        "chipyard/generators/gemmini/software/gemmini-rocc-tests/include/gemmini_params_q31.h",
   "header_defines": {
     "DIM":          "32",
     "elem_t":       "?",
