@@ -109,6 +109,29 @@ class SplitPieceTests(unittest.TestCase):
         self.assertEqual(conv["inputs"], sl["outputs"])
 
 
+class _ConstSplit(torch.nn.Module):
+    """A piece of a constant buffer: folded at extract time, never a runtime copy."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("table", torch.randn(1, 6, 4, 5))
+        self.conv = torch.nn.Conv2d(3, 4, 1)
+
+    def forward(self, x):
+        return self.conv(x + torch.split(self.table, 3, dim=1)[1])
+
+
+class ConstSplitTests(unittest.TestCase):
+
+    def test_constant_piece_is_folded(self):
+        w = _walk(_ConstSplit(), torch.randn(1, 3, 4, 5))
+        self.assertNotIn("slice_c_s8", [op["op"] for op in w.ops])
+        add = next(op for op in w.ops if op["op"].startswith("add"))
+        piece = [t for t in add["inputs"] if t != "x"][0]
+        self.assertEqual(w.tensors_meta[piece]["quant"]["kind"], "constant_buffer")
+        self.assertEqual(tuple(w.tensors_meta[piece]["shape"]), (1, 3, 4, 5))
+
+
 class _NormTail(torch.nn.Module):
     def __init__(self, reuse_norm=False):
         super().__init__()
@@ -141,3 +164,64 @@ class TailTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PadRelu(torch.nn.Module):
+    """Ops whose kernels move or clamp codes without requantizing."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(8, 8)
+        with torch.no_grad():
+            self.fc.bias.fill_(-3.0)  # largest |relu input| is negative
+        self.conv0 = torch.nn.Conv2d(2, 2, 1)
+        self.conv = torch.nn.Conv2d(2, 2, 3, stride=2)
+
+    def forward(self, x, img):
+        y = torch.relu(self.fc(x))
+        z = self.conv(F.pad(self.conv0(img), (0, 1, 0, 1)))
+        return y, z
+
+
+class CodeCopyScaleTests(unittest.TestCase):
+
+    def test_pad_and_relu_carry_their_input_scale(self):
+        w = _walk(_PadRelu(), torch.randn(3, 8), torch.randn(1, 2, 8, 8))
+        checked = 0
+        for op in w.ops:
+            if op["op"] in ("pad_s8", "relu_s8"):
+                i, o = op["inputs"][0], op["outputs"][0]
+                self.assertEqual(op["quant"]["scale_in"], op["quant"]["scale_out"])
+                self.assertEqual(w.tensors_meta[o]["quant"]["scale"],
+                                 w.tensors_meta[i]["quant"]["scale"])
+                checked += 1
+        self.assertEqual(checked, 2)
+
+
+class DepthwisePerChannelTests(unittest.TestCase):
+
+    def _walk_dw(self, pc_dw):
+        m = torch.nn.Sequential(torch.nn.Conv2d(4, 4, 3, padding=1, groups=4)).eval()
+        with torch.no_grad():
+            m[0].weight.mul_(torch.tensor([1.0, 10.0, 0.1, 3.0]).view(4, 1, 1, 1))
+        x = torch.randn(1, 4, 6, 6)
+        ep = torch.export.export(m, (x,))
+        names = [s.arg.name for s in ep.graph_signature.input_specs if s.kind.name == "USER_INPUT"]
+        w = ege._ExportWalker(ep, [{names[0]: x}], names, per_channel=True, quant="int8",
+                              op_precision={}, per_channel_depthwise=pc_dw)
+        w.calibrate()
+        w.emit()
+        return w
+
+    def test_default_stays_per_tensor(self):
+        w = self._walk_dw(False)
+        self.assertEqual([op["op"] for op in w.ops], ["depthwise_conv2d_s8"])
+
+    def test_opt_in_is_per_channel(self):
+        w = self._walk_dw(True)
+        op = w.ops[0]
+        self.assertEqual(op["op"], "depthwise_conv2d_s8_pc")
+        wq = w.weights_blob[op["weight"]]
+        # every channel uses the full int8 range despite the 100x magnitude spread
+        self.assertTrue(all(abs(int(wq[c].min())) == 127 or int(wq[c].max()) == 127 for c in range(4)))
+        self.assertEqual(len(w.weights_blob[op["quant"]["output_multiplier_per_oc_key"]]), 4)

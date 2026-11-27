@@ -1,0 +1,12 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// y = lut[x + 128]: an int8 -> int8 op (gelu_s8 / sin_s8 / cos_s8) whose 256 outputs
+// the launcher computed with the reference's own formula and libm
+layout(push_constant, scalar) uniform PC { I8 x; I8 lut; I8 y; int n; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    pc.y.v[int(gi)] = pc.lut.v[int(pc.x.v[int(gi)]) + 128];
+}

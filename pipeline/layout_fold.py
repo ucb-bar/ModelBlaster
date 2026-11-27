@@ -327,6 +327,7 @@ def _try_fold(graph, op, prod, readers, outs):
         c_final, c_map, c_ops = c_t, _natural(bt, M, N), []
     if not (a_ops or b_ops or c_ops):
         return None
+    c_root_c = c_final
     cands = {1}
     for m, r, c in ((a_map, M, K), (b_map, K, N), (c_map, M, N)):
         dims = [x for x in m[1] if x[0] != 1]
@@ -338,16 +339,26 @@ def _try_fold(graph, op, prod, readers, outs):
         for d, _ in dims:
             if bt % d == 0:
                 cands.add(d)
+    natural = {"a": (a_t, _natural(bt, M, K), []), "b": (b_t, _natural(bt, K, N), []),
+               "c": (c_t, _natural(bt, M, N), [])}
     for B1 in sorted(cands, reverse=True):
         B0 = bt // B1
         fa = fit(a_map[1], [B0, B1, M, K])
         fb = fit(b_map[1], [B0, B1, K, N])
         fc = fit(c_map[1], [B0, B1, M, N])
-        if None in (fa, fb, fc):
-            continue
-        # every operand must stay a dense row- or column-major matrix
-        if 1 not in (fa[2], fa[3]) or 1 not in (fb[2], fb[3]) or 1 not in (fc[2], fc[3]):
-            continue
+        ok = lambda f, i, j: f is not None and 1 in (f[i], f[j])   # a dense row- or column-major matrix
+        if not (ok(fa, 2, 3) and ok(fb, 2, 3) and ok(fc, 2, 3)):
+            # an operand whose copy chain does not fit keeps its copy (the others may still fold)
+            alt = {"a": (a_root, a_map, a_ops, fa), "b": (b_root, b_map, b_ops, fb), "c": (c_root_c, c_map, c_ops, fc)}
+            for k, (r, m, o, f) in alt.items():
+                if not ok(f, 2, 3) and o:
+                    nr, nm, no = natural[k]
+                    alt[k] = (nr, nm, no, fit(nm[1], [B0, B1] + ([M, K] if k == "a" else [K, N] if k == "b" else [M, N])))
+            if not all(ok(v[3], 2, 3) for v in alt.values()) or not any(v[2] for v in alt.values()):
+                continue
+            (a_root, a_map, a_ops, fa), (b_root, b_map, b_ops, fb), (c_root_c, c_map, c_ops, fc) = (
+                alt["a"], alt["b"], alt["c"])
+            c_final = c_root_c
         shape = {"B0": B0, "B1": B1, "M": M, "K": K, "N": N,
                  "a_off": a_map[0], "a_s0": fa[0], "a_s1": fa[1], "a_sm": fa[2], "a_sk": fa[3],
                  "b_off": b_map[0], "b_s0": fb[0], "b_s1": fb[1], "b_sk": fb[2], "b_sn": fb[3],

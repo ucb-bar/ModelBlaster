@@ -1,0 +1,3 @@
+#version 460
+// skinny GEMM, fp32 weights (skinny_body.glsl)
+#include "skinny_body.glsl"

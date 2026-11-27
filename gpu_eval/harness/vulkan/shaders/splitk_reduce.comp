@@ -1,0 +1,15 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// C[b, m, n] = alpha * sum_s part[(b * nsplit + s) * MN + m * N + n] (+ bias[n])
+layout(push_constant, scalar) uniform PC { F32 part; F32 C; F32 bias; int n; int MN; int N; int nsplit; int sCb; float alpha; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi), b = i / pc.MN, r = i % pc.MN;
+    float a = 0.0;
+    for (int s = 0; s < pc.nsplit; s++) a += pc.part.v[(b * pc.nsplit + s) * pc.MN + r];
+    a *= pc.alpha;
+    if (uint64_t(pc.bias) != 0ul) a += pc.bias.v[r % pc.N];
+    pc.C.v[b * pc.sCb + r] = a;
+}

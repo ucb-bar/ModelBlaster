@@ -1,0 +1,4 @@
+#version 460
+// skinny GEMM, fp16 weights (skinny_body.glsl)
+#define WF16
+#include "skinny_body.glsl"

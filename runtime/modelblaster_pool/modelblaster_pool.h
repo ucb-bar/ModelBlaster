@@ -113,6 +113,27 @@ void modelblaster_pool_parallelize_1d(modelblaster_pool_t pool,
                                 size_t range,
                                 unsigned flags);
 
+/* ---- static gangs (Linux and Zephyr, via xs_os.h) --------------------------
+ * A gang is a pool WITHOUT threads of its own. The schedule runtime's worker
+ * for harts[0] is the master; the workers of the other harts each have a
+ * "slice" entry in their own static list at the same schedule position and
+ * call modelblaster_pool_gang_serve() there. parallelize_1d() on a gang pool
+ * publishes the job to those callers instead of waking pool threads, so a
+ * split operator needs no helper threads, no start/done semaphores and no
+ * per-hart locks: exclusivity comes from the workers' static order.
+ *
+ *   master:  gang_open(g, token); <kernel, calls parallelize_1d(g, ...)>;
+ *            gang_close(g, token);
+ *   helper:  gang_serve(g, wid, token, spin_first);   returns after close
+ *
+ * `token` identifies one execution of one gang entry and must increase from
+ * one use of the gang to the next (the runtime uses epoch * N + entry + 1). */
+modelblaster_pool_t modelblaster_pool_create_gang(int n_workers);
+void modelblaster_pool_gang_open(modelblaster_pool_t gang, unsigned long long token);
+void modelblaster_pool_gang_close(modelblaster_pool_t gang, unsigned long long token);
+void modelblaster_pool_gang_serve(modelblaster_pool_t gang, int wid,
+                                  unsigned long long token, int spin_first);
+
 #ifdef __cplusplus
 }
 #endif

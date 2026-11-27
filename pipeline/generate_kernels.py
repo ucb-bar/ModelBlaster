@@ -190,6 +190,54 @@ def _assert_curated_layout_contract(spec, algorithm, backend, curated_path):
         )
 
 
+def _curated_path(global_curated_dir, backend_name: str, op: str,
+                  algo_name: str) -> Optional[str]:
+    """Where a curated kernel for this backend lives, following its lineage.
+
+    A backend VARIANT keeps its parent's kernels: only the -march/-mabi differ,
+    and kernels are C. backends.backend_lineage says so, and its docstring says
+    the lineage "belongs in one place that every per-backend lookup consults" --
+    but the curated lookup did not consult it. It joined <dir>/<backend>/ and
+    stopped, so a variant found an empty directory, every op fell back to the
+    scalar reference, and the build reported success. That is precisely the
+    silent failure the docstring was written about; gemmini_q31_softfp hit it
+    on its first run, with all seven ops falling back.
+    """
+    if global_curated_dir is None:
+        return None
+    from modelblaster.pipeline import backends as _backends_mod
+    for root in _curated_roots(global_curated_dir):
+        for name in _backends_mod.backend_lineage(backend_name):
+            candidate = os.path.join(
+                root, name, f"{name}_{op}_{algo_name}.c")
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _curated_roots(global_curated_dir) -> list[str]:
+    """The curated library roots, in probe order.
+
+    --global-curated-dir takes one directory or an os.pathsep-separated list.
+    The first root is normally this repository's kernels/; later roots let a
+    downstream project supply curated kernels for its own algorithms (see
+    reference_kernels.load_extensions) in the same <root>/<target>/ layout
+    without copying them in here. The first root holding a file wins.
+    """
+    if not global_curated_dir:
+        return []
+    return [r for r in str(global_curated_dir).split(os.pathsep) if r]
+
+
+def _curated_file(global_curated_dir, subdir: str, filename: str) -> Optional[str]:
+    """<root>/<subdir>/<filename> in the first curated root that has it."""
+    for root in _curated_roots(global_curated_dir):
+        candidate = os.path.join(root, subdir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _parse_curated_accuracy_class(src: str) -> Optional[AccuracyClass]:
     m = _ACCURACY_CLASS_RE.search(src)
     if not m:
@@ -687,6 +735,18 @@ def _verify(
         # only an explicit statement that N LSB is acceptable for this build.
         # Unset by default, so the exact kernel stays the default everywhere.
         _drift_atol = os.environ.get("MB_DRIFT_ATOL")
+        from modelblaster.pipeline.profile_kernel import io_is_exact
+        _exact = io_is_exact(io_path)
+        if _exact:
+            # An integer golden (io.npz declares `exact`) is the
+            # reference itself: every candidate must reproduce it bit for bit,
+            # whatever the backend's float-golden tolerance. Only a candidate
+            # that DECLARES numeric drift may be let through by MB_DRIFT_ATOL.
+            _atol, _rtol_override = 0.0, 0.0
+            if _drift_atol and accuracy_class != AccuracyClass.NUMERIC_DRIFT:
+                print(f"  [{spec.op}] MB_DRIFT_ATOL ignored: integer golden and a "
+                      f"{getattr(accuracy_class, 'value', accuracy_class)} candidate")
+                _drift_atol = None
         if _drift_atol:
             try:
                 _da = float(_drift_atol)
@@ -713,6 +773,14 @@ def _verify(
             )
         except ProfileError as e:
             return VerifyResult(False, f"spike-harness build/run failed:\n{e}")
+        if res.golden_ok is False and res.layers_bad:
+            return VerifyResult(
+                False,
+                f"per-layer golden: {res.layers_bad} tensor(s) differ, the first "
+                f"{res.first_bad_layer!r} ({res.layers_ok} match)",
+                max_abs_err=res.golden_max_abs_err,
+                max_rel_err=res.golden_max_rel_err,
+            )
         if res.golden_ok is False:
             # Decode where the divergence happened so the LLM has something
             # actionable to fix on retry.
@@ -906,7 +974,7 @@ def generate_one_llm(
     # Also drop algorithms whose target_affinity excludes this backend.
     candidates = [
         a for a in candidates
-        if not a.target_affinity or backend.name in a.target_affinity
+        if not a.target_affinity or backends_mod.affined(a.target_affinity, backend.name)
     ]
     if not candidates:
         log(f"  [{spec.op}] no algorithms remain after target_affinity "
@@ -930,14 +998,14 @@ def generate_one_llm(
     # selection toward target-affined kernels and let real-HW (FireSim)
     # rank them when re-rank is enabled.
     has_target_affined = any(
-        a.target_affinity and backend.name in a.target_affinity
+        backends_mod.affined(a.target_affinity, backend.name)
         for a in candidates
     )
     if has_target_affined:
         before = [a.name for a in candidates]
         candidates = [
             a for a in candidates
-            if a.target_affinity and backend.name in a.target_affinity
+            if backends_mod.affined(a.target_affinity, backend.name)
         ]
         dropped = [n for n in before if n not in (a.name for a in candidates)]
         if dropped:
@@ -981,11 +1049,9 @@ def generate_one_llm(
             )
 
             # --- curated probe (subset: only algorithms that have a file) ---
-            curated_path = (
-                os.path.join(global_curated_dir, backend.name, filename)
-                if global_curated_dir else None
-            )
-            if curated_path and os.path.exists(curated_path):
+            curated_path = _curated_path(
+                global_curated_dir, backend.name, spec.op, algorithm.name)
+            if curated_path:
                 _assert_curated_layout_contract(
                     spec, algorithm, backend, curated_path)
                 curated = open(curated_path).read()
@@ -1316,9 +1382,11 @@ def curated_seed_for(ir, specs, target, global_curated_dir,
             key=lambda a: (getattr(a, "accuracy_class", 0) or 0),
         )
         for algorithm in cands:
-            fn = f"{target.name}_{spec.op}_{algorithm.name}.c"
-            cp = os.path.join(global_curated_dir, target.name, fn)
-            if not os.path.exists(cp):
+            if getattr(algorithm, "pin_only", False):
+                continue    # opt-in lowerings never become anyone's baseline
+            cp = _curated_path(
+                global_curated_dir, target.name, spec.op, algorithm.name)
+            if cp is None:
                 continue
             if not act_layout_candidate_ok(ir, spec, algorithm, target):
                 _log(f"  [{spec.op}/{algorithm.name}] not seeded: "
@@ -1357,6 +1425,12 @@ def generate(
     # a curated kernel exists for them. The consumer of XPU-RT's
     # `choose_implementation` advice -- see `keep_reference_ops` below.
     keep_reference_ops: Optional[set[str]] = None,
+    # op kind -> algorithm name. The reference path probes ONLY that algorithm
+    # for the op and fails the run if no source supplies it. This is how an
+    # opt-in algorithm (AlgorithmCandidate.pin_only: an accelerator lowering, a
+    # numerics variant) is selected: first-found-wins would otherwise keep the
+    # algorithm listed first.
+    pin_algorithms: Optional[dict[str, str]] = None,
     # Opt-in: after the spike beam search picks a best, re-rank the
     # top-K spike survivors on FireSim RTL. The cache slot is replaced
     # with the firesim-best only if the firesim cycles drop by >=
@@ -1552,7 +1626,11 @@ def generate(
                     # Already swapped by an earlier source (cache beats
                     # global_curated, since cache was vetted for THIS model).
                     continue
-                for algorithm in spec.algorithms:
+                _algos = [a for a in spec.algorithms if not getattr(a, "pin_only", False)]
+                if pin_algorithms and spec.op in pin_algorithms:
+                    _algos = [a for a in spec.algorithms
+                              if a.name == pin_algorithms[spec.op]]
+                for algorithm in _algos:
                     candidate_path = path_layout(spec, algorithm)
                     if not candidate_path or not os.path.exists(candidate_path):
                         continue
@@ -1605,6 +1683,28 @@ def generate(
                                 f"falling back to reference_impl")
                             accepted = False
                             vres = None
+                            # Was this a BUILD failure, as opposed to this
+                            # kernel simply being wrong or the simulator being
+                            # absent? Only a build failure justifies the
+                            # recovery below, whose premise is a poisoned
+                            # baseline -- another op's kernel failing to
+                            # compile and taking this one down with it.
+                            # profile_kernel raises ProfileError for the
+                            # build/run path; anything else is this op's own
+                            # business and re-verifying against a clean
+                            # baseline would prove nothing.
+                            #
+                            # This was previously a bare reference to an
+                            # undefined name, so the handler raised NameError
+                            # instead of falling back to reference_impl. It
+                            # only fired when _verify itself raised, i.e.
+                            # exactly when spike is missing -- so on any
+                            # machine without a simulator, codegen died here
+                            # rather than degrading to correct-and-slow.
+                            from modelblaster.pipeline.profile_kernel import (
+                                ProfileError as _ProfileError,
+                            )
+                            _build_fail = isinstance(e, _ProfileError)
                             if (_build_fail and curated_seed
                                     and os.environ.get("MB_PRESEED_RECOVER")
                                     == "1"):
@@ -1719,6 +1819,17 @@ def generate(
         # BACKEND=llm run). Files at <cache_dir>/<target>_<op>_<algo>.c
         # — note the flat layout (no <target>/ subdir) since cache_dir
         # is already per-target.
+        if pin_algorithms:
+            _known = {sp.op: {a.name for a in sp.algorithms} for sp in specs}
+            for _op, _al in pin_algorithms.items():
+                if _op not in _known:
+                    raise SystemExit(f"--pin-algorithm {_op}={_al}: this model has "
+                                     f"no {_op} op")
+                if _al not in _known[_op]:
+                    raise SystemExit(f"--pin-algorithm {_op}={_al}: unknown algorithm; "
+                                     f"{_op} has {sorted(_known[_op])}")
+                curated_seed.pop(_op, None)
+                impls[_op] = next(sp for sp in specs if sp.op == _op).reference_impl
         _probe_swap(
             "cache",
             cache_dir,
@@ -1732,7 +1843,7 @@ def generate(
         _probe_swap(
             "curated",
             global_curated_dir,
-            lambda spec, algorithm: os.path.join(
+            lambda spec, algorithm: _curated_file(
                 global_curated_dir, target.name,
                 f"{target.name}_{spec.op}_{algorithm.name}.c",
             ) if global_curated_dir else None,
@@ -1746,11 +1857,19 @@ def generate(
             _probe_swap(
                 f"curated[{_alias}]",
                 global_curated_dir,
-                lambda spec, algorithm, _a=_alias: os.path.join(
+                lambda spec, algorithm, _a=_alias: _curated_file(
                     global_curated_dir, _a,
                     f"{_a}_{spec.op}_{algorithm.name}.c",
                 ) if global_curated_dir else None,
             )
+        for _op, _al in (pin_algorithms or {}).items():
+            if kernel_picks.get(_op, {}).get("algorithm") != _al:
+                raise SystemExit(
+                    f"--pin-algorithm {_op}={_al}: no curated or cached source "
+                    f"for target {target.name} was accepted (looked for "
+                    f"{target.name}_{_op}_{_al}.c along the curated lineage)")
+            kernel_picks[_op]["pinned"] = True
+            log(f"  [{_op}] pinned to algorithm {_al}")
     elif backend_name == "llm":
         # Lazy proxy: BedrockClient() is only instantiated when actually needed
         # for LLM inference. Curated/cached kernel hits skip LLM entirely, so
@@ -2077,7 +2196,9 @@ def main() -> None:
                          "spike-harness verify and --optimize)")
     ap.add_argument("--global-curated-dir", default=None,
                     help="root of the global curated kernel library "
-                         "(<root>/<target>/<backend>_<op>_<algo>.c). "
+                         "(<root>/<target>/<backend>_<op>_<algo>.c), or an "
+                         "os.pathsep-separated list of roots probed in order "
+                         "(extra roots hold an extension's kernels). "
                          "Probed before the per-model cache; hits are "
                          "promoted into the per-model cache on first use.")
     ap.add_argument("--cache-dir", default=None,
@@ -2092,6 +2213,12 @@ def main() -> None:
                          "turns the advice into this list. The advised timing "
                          "was measured in a different BUILD, so the change has "
                          "to be re-profiled, not assumed.")
+    ap.add_argument("--pin-algorithm", action="append", default=[],
+                    metavar="OP=ALGO",
+                    help="reference backend: use exactly this curated algorithm "
+                         "for this op kind, or fail (repeatable). Selects an "
+                         "opt-in (pin_only) algorithm, e.g. "
+                         "conv2d_s8=q31_acc_scale.")
     ap.add_argument("--algorithms", default="all",
                     help=("comma-separated algorithm names to try (in order) "
                           "for each op, or 'all' (default) to try every "
@@ -2172,6 +2299,8 @@ def main() -> None:
         firesim_top_k=args.firesim_top_k,
         cache_aware_prompt=args.cache_aware_prompt,
         firesim_op_filter=firesim_op_filter,
+        pin_algorithms=(dict(p.split("=", 1) for p in args.pin_algorithm)
+                        if args.pin_algorithm else None),
     )
 
 

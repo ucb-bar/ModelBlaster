@@ -170,6 +170,35 @@ class DeviceTest(unittest.TestCase):
             self.assertEqual(rp.returncode, 0, rp.stdout[-2000:])
 
 
+INTQ_OPS = ("copy_q", "repeat_q", "slice_c_q", "permute4_q", "cat2_c1_q",          # naive kernels, bit-exact
+            "gap_q", "mul_c1_q", "add_q", "vint_action_post_acc")                  # placeholders: MB_ERROR
+
+
+@unittest.skipUnless(_opencl_gpu(), "needs g++ and an OpenCL GPU with coarse-grained SVM "
+                                    "(MB_CL_DEVICE_TYPE=cpu accepts a CPU device such as PoCL)")
+class IntegerKindsTest(unittest.TestCase):
+    def test_data_movement_seeds_are_bit_exact_and_placeholders_report_mb_error(self):
+        """The integer-closed kinds' OpenCL seeds against their spec reference_impl, at every code width
+        (8/15/16/32/64 bits), several permutations and mixed cat widths; the arithmetic kinds' placeholders
+        must set MB_ERROR naming themselves."""
+        from modelblaster.pipeline.reference_kernels import KERNEL_SPECS
+        s, ent = _seeds(), {op: e for e, op in all_entries("fp32").items()}
+        refs = "\n".join(re.sub(r"\bkernel_(\w+)\(", r"ref_\1(", KERNEL_SPECS[o].reference_impl)
+                         for o in INTQ_OPS[:5])
+        slots = "\n".join(wrap_slot(o, s.slot_source(ent[o])) for o in INTQ_OPS)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "slots.cpp").write_text(slots + '\nextern "C" {\n' + refs.replace("#include <stdint.h>", "") + "\n}\n")
+            drv = Path(__file__).with_name("opencl_intq_driver.cpp")
+            cp = subprocess.run(["g++", "-std=c++11", "-w", "-O1", f"-I{RUNTIME_H.parent}", f"-I{d}", "-o",
+                                 str(d / "t"), str(drv), "-lOpenCL"], capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr[-3000:])
+            rp = subprocess.run([str(d / "t")], capture_output=True, text=True, timeout=600)
+        self.assertEqual(rp.returncode, 0, rp.stdout[-3000:])
+        self.assertIn("data-movement: 90/90 cases bit-exact", rp.stdout)
+        self.assertIn("placeholders: 4/4 report MB_ERROR", rp.stdout)
+
+
 MODEL = '''import torch
 import torch.nn as nn
 class Model(nn.Module):

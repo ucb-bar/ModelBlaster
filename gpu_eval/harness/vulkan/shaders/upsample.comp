@@ -1,0 +1,11 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int n; int IH; int IW; int s; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.n) return;
+    int i = int(gi), OH = pc.IH * pc.s, OW = pc.IW * pc.s;
+    int ow = i % OW, oh = (i / OW) % OH, nc = i / (OW * OH);
+    pc.y.v[i] = pc.x.v[(nc * pc.IH + oh / pc.s) * pc.IW + ow / pc.s];
+}

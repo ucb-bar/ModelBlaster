@@ -1,0 +1,30 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// one workgroup per (n, group) of [N, C, HW]: biased variance, per-channel affine
+layout(push_constant, scalar) uniform PC { F32 x; F32 g; F32 b; F32 y; int C; int G; int HW; float eps; } pc;
+shared float sv[256];
+float tree(float v) {
+    uint t = gl_LocalInvocationID.x;
+    sv[t] = v;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) { if (t < s) sv[t] += sv[t + s]; barrier(); }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+void main() {
+    int line = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    int n = line / pc.G, g = line % pc.G, cpg = pc.C / pc.G;
+    int cnt = cpg * pc.HW, base = (n * pc.C + g * cpg) * pc.HW, t = int(gl_LocalInvocationID.x);
+    float s = 0.0;
+    for (int j = t; j < cnt; j += 256) s += pc.x.v[base + j];
+    float mean = tree(s) / float(cnt);
+    float q = 0.0;
+    for (int j = t; j < cnt; j += 256) { float d = pc.x.v[base + j] - mean; q += d * d; }
+    float inv = inversesqrt(tree(q) / float(cnt) + pc.eps);
+    for (int j = t; j < cnt; j += 256) {
+        int c = g * cpg + j / pc.HW;
+        pc.y.v[base + j] = (pc.x.v[base + j] - mean) * inv * pc.g.v[c] + pc.b.v[c];
+    }
+}

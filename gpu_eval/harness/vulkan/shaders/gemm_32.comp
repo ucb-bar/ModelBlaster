@@ -1,0 +1,7 @@
+#version 460
+// 32 x 128 tiles: M <= 32
+#define WX 32
+#define WY 8
+#define TM 4
+#define TN 4
+#include "gemm_body.glsl"

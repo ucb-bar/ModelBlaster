@@ -1,0 +1,28 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+// kernel_linear_s8 on packed int8 dot products (dot_s8_body.glsl); epilogue as linear_s8.comp
+layout(push_constant, scalar) uniform PC {
+    I32 x; I32 w; I32 bias; I8 y; int M; int K; int N; int in_off; int f_off; int out_off; int mult; int shift; int amin; int amax;
+} pc;
+#include "dot_s8_body.glsl"
+void main() {
+    int acc[RM][RN], m0, n0;
+    dot_s8(pc.x, pc.w, pc.M, pc.K, pc.N, pc.in_off, pc.f_off, acc, m0, n0);
+    bool hb = uint64_t(pc.bias) != 0ul;
+    [[unroll]] for (int j = 0; j < RN; j++) {
+        int n = n0 + j;
+        if (n >= pc.N) break;
+        int b = hb ? pc.bias.v[n] : 0;
+        [[unroll]] for (int i = 0; i < RM; i++) {
+            int m = m0 + i;
+            if (m >= pc.M) break;
+            int a = acc[i][j] + b;
+            int64_t prod = (int64_t(a) * int64_t(pc.mult) + (int64_t(1) << 30)) >> 31;
+            int scaled = int(prod);
+            if (pc.shift > 0) scaled = int((int64_t(scaled) + (int64_t(1) << (pc.shift - 1))) >> pc.shift);
+            else if (pc.shift < 0) scaled = scaled << (-pc.shift);
+            pc.y.v[m * pc.N + n] = int8_t(mb_clampi(scaled + pc.out_off, pc.amin, pc.amax));
+        }
+    }
+}

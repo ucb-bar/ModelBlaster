@@ -204,6 +204,10 @@ SCHED_NAME="$(basename "${SCHEDULE}" .json)"
 # Absolute: build_posix.sh runs from its own directory.
 GEN_DIR="${REPO_ROOT}/${OUT_ROOT}/_gen/${SCHED_NAME}"
 BUILD_DIR="${REPO_ROOT}/${OUT_ROOT}/_build/${SCHED_NAME}"
+# XPURT_WALKER=static|skip|strict selects the static-program
+# walker generator (pipeline/generate_xpurt_main_static.py); unset = main's
+# own generator, unchanged.
+XPURT_WALKER="${XPURT_WALKER:-}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR}"
 
 echo "=== 1/5 generate per-(model, backend) sources ==="
@@ -415,7 +419,10 @@ done
 ${PY} -m modelblaster.pipeline.ingest_xpurt_schedule \
     --schedule "${SCHEDULE}" --registry "${REGISTRY}" \
     "${IR_ARGS[@]}" --out "${SCHED_C}" --name "${SCHED_NAME}" \
-    --cpu-p-kind "${CPU_P_KIND}" --cpu-e-kind "${CPU_E_KIND}"
+    --cpu-p-kind "${CPU_P_KIND}" --cpu-e-kind "${CPU_E_KIND}" \
+    ${XPURT_WALKER:+$([[ "${XPURT_WALKER}" == static ]] && echo "--static-program-json ${GEN_DIR}/${SCHED_NAME}_program.json")} \
+    ${XPURT_WALKER:+$([[ "${XPURT_WALKER}" == static && -n "${XPURT_HYPER_MS:-}" ]] && echo --static-cyclic)} \
+    ${XPURT_WALKER:+$([[ "${XPURT_WALKER}" == static && "${XPURT_STATIC_NO_GANG:-0}" == 1 ]] && echo --static-no-gang)}
 [[ -f "${SCHED_C}" ]] || { echo "ingest produced no dispatch table" >&2; exit 1; }
 echo "  ${SCHED_C}"
 
@@ -478,6 +485,17 @@ fi
 
 echo "=== 3/5 generate the walker (--worker-granularity ${WORKERS}) ==="
 MAIN_C="${GEN_DIR}/${SCHED_NAME}_main.c"
+if [[ -n "${XPURT_WALKER}" ]]; then
+  _sw=(--walker "${XPURT_WALKER}")
+  [[ -n "${XPURT_HYPER_MS:-}" ]] && _sw+=(--hyperperiod-ms "${XPURT_HYPER_MS}")
+  [[ "${XPURT_WALKER}" == static ]] && _sw+=(--program-json "${GEN_DIR}/${SCHED_NAME}_program.json")
+  [[ "${MB_XPURT_WARMUP:-1}" == "1" ]] && _sw+=(--warmup)
+  ${PY} -m modelblaster.pipeline.generate_xpurt_main_static \
+    --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
+    --dispatch-table-header "$(basename "${SCHED_H}")" \
+    --platform linux --core-kinds "${CORE_KINDS}" --backends "${BACKENDS}" \
+    --networks "${MODELS}" --registry "${REGISTRY}" "${_sw[@]}"
+else
 ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --schedule "${SCHEDULE}" --out "${MAIN_C}" --name "${SCHED_NAME}" \
     --dispatch-table-header "$(basename "${SCHED_H}")" \
@@ -485,6 +503,11 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     ${IMPL_BACKENDS:+--impl-backends "${IMPL_BACKENDS}"} \
     --registry "${REGISTRY}" --worker-granularity "${WORKERS}" "${DYNAMIC_ARGS[@]}" \
     ${WALKER_OPTS[@]+"${WALKER_OPTS[@]}"}
+fi
+# Optional post-processing of the generated walker
+# (K3RT_POST_MAIN <main.c> <SCHED_NAME> <gen dir>) or a replacement main.
+if [[ -n "${K3RT_POST_MAIN:-}" ]]; then ${K3RT_POST_MAIN} "${MAIN_C}" "${SCHED_NAME}" "${GEN_DIR}"; fi
+if [[ -n "${K3RT_MAIN_OVERRIDE:-}" ]]; then MAIN_C="${K3RT_MAIN_OVERRIDE}"; fi
 
 echo "=== 4/5 cross-build (harness_xpurt/build_posix.sh) ==="
 # A100 harts that must register with the kernel (registry ai_thread_cpus);
@@ -505,6 +528,7 @@ MODELBLASTER_XPURT_STREAM="${STREAM}" \
 [[ -x "${BIN}" ]] || { echo "no binary at ${BIN}" >&2; exit 1; }
 echo "  $(file -b "${BIN}" | cut -c1-70)"
 
+[[ -n "${K3RT_BIN_NAME:-}" ]] && cp "${BIN}" "${GEN_DIR}/${K3RT_BIN_NAME}"
 if [[ "${MB_XPURT_BUILD_ONLY:-0}" == "1" ]]; then
     echo "MB_XPURT_BUILD_ONLY=1: built ${BIN}; not deploying"
     exit 0

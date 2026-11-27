@@ -1,0 +1,30 @@
+#version 460
+#define MB_INT8
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// kernel_layernorm_s8 (rms == 0) / kernel_rmsnorm_s8 (rms == 1): the reference's
+// fp64 arithmetic in its order, one invocation per row.
+layout(push_constant, scalar) uniform PC { I8 x; F32 g; F32 b; I8 y; int M; int K; float sin_; float sout; float eps; int amin; int amax; int rms; } pc;
+void main() {
+    int64_t gi = MB_GID;
+    if (gi >= pc.M) return;
+    int base = int(gi) * pc.K;
+    double si = double(pc.sin_);
+    precise double mu = 0.0LF;
+    if (pc.rms == 0) {
+        for (int k = 0; k < pc.K; k++) mu += double(pc.x.v[base + k]) * si;
+        mu /= double(pc.K);
+    }
+    precise double acc = 0.0LF;
+    for (int k = 0; k < pc.K; k++) { precise double d = double(pc.x.v[base + k]) * si - mu; acc += d * d; }
+    acc /= double(pc.K);
+    precise double inv = 1.0LF / sqrt(acc + double(pc.eps));
+    bool hg = uint64_t(pc.g) != 0ul, hb = uint64_t(pc.b) != 0ul;
+    for (int k = 0; k < pc.K; k++) {
+        precise double xn = (double(pc.x.v[base + k]) * si - mu) * inv;
+        precise double yv = xn * double(hg ? pc.g.v[k] : 1.0);
+        if (pc.rms == 0 && hb) yv += double(pc.b.v[k]);
+        int v = int(mb_round(yv / double(pc.sout)));
+        pc.y.v[base + k] = int8_t(mb_clampi(v, pc.amin, pc.amax));
+    }
+}

@@ -1,0 +1,48 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// elements per invocation: 4 = one vec4 of the innermost dim (the launcher checked
+// d5 % 4 == 0, unit or zero innermost strides and 16-byte alignment)
+layout(constant_id = 0) const int VEC = 1;
+layout(constant_id = 1) const int OPC = 0;   // the opcode (pc.opc is ignored): one pipeline per op
+// y[i] = op(a[strided], b[strided]) over a 6-d iteration space (broadcast = stride 0);
+// the launcher coalesced the dims, only the innermost nd are not 1
+layout(push_constant, scalar) uniform PC {
+    F32 a; F32 b; F32 y; int n; int opc; float alpha;
+    int d1, d2, d3, d4, d5;
+    int sa0, sa1, sa2, sa3, sa4, sa5;
+    int sb0, sb1, sb2, sb3, sb4, sb5;
+    int nd;
+} pc;
+float e2(float x, float y, int opc, float alpha) {
+    switch (opc) {
+    case 0: return x + alpha * y;  case 1: return x - alpha * y;  case 2: return x * y;
+    case 3: return x / y;  case 4: return (x > y || isnan(x)) ? x : y;
+    case 5: return (x < y || isnan(x)) ? x : y;  case 6: return pow(x, y);
+    case 7: return y != 0.0 ? alpha : x;  case 8: return float(x == y);  case 9: return float(x != y);
+    case 10: return float(x < y);  case 11: return float(x <= y);  case 12: return float(x > y);  case 13: return float(x >= y);
+    default: return x;
+    }
+}
+#define DIM(D, SA, SB) { int q = r / D; int i = r - q * D; oa += i * SA; ob += i * SB; r = q; }
+void main() {
+    int e = int(MB_GID) * VEC;
+    if (e >= pc.n) return;
+    int r = e, oa = 0, ob = 0, nd = pc.nd;
+    DIM(pc.d5, pc.sa5, pc.sb5)
+    if (nd > 1) DIM(pc.d4, pc.sa4, pc.sb4)
+    if (nd > 2) DIM(pc.d3, pc.sa3, pc.sb3)
+    if (nd > 3) DIM(pc.d2, pc.sa2, pc.sb2)
+    if (nd > 4) DIM(pc.d1, pc.sa1, pc.sb1)
+    oa += r * pc.sa0;
+    ob += r * pc.sb0;
+    if (VEC == 4) {
+        vec4 x = pc.sa5 != 0 ? MB_V4(pc.a, oa) : vec4(pc.a.v[oa]);
+        vec4 v = pc.sb5 != 0 ? MB_V4(pc.b, ob) : vec4(pc.b.v[ob]);
+        vec4 z;
+        for (int j = 0; j < 4; j++) z[j] = e2(x[j], v[j], OPC, pc.alpha);
+        MB_V4(pc.y, e) = z;
+    } else {
+        pc.y.v[e] = e2(pc.a.v[oa], pc.b.v[ob], OPC, pc.alpha);
+    }
+}

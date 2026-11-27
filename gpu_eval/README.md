@@ -15,6 +15,9 @@ problem.
 | `cuda/mb_cuda_kernels.cu` | hand-written CUDA kernel per op, with MB's C signatures |
 | `cuda/mb_cuda_kernels_f16.cu` | the `_f16` kernels (fp16 storage, fp32 math), **generated** by `f16_kernels.py` from the fp32 file + `cuda/mb_cuda_kernels_f16_hand.cu`; see `docs/fp16_cuda.md` |
 | `ref2cuda.py` | ports each MB reference C kernel to a single-thread CUDA seed |
+| `walk_vulkan.py` | the CUDA walk's gates on a Vulkan GPU (AMD RDNA via RADV: the Steam Deck; no ROCm, no GPU torch): golden, every kernel in isolation vs walk_torch on the CPU, timestamps, captured-graph replay; see [docs/vulkan_amd.md](../docs/vulkan_amd.md) |
+| `vulkan/` | the Vulkan backend: runtime (`mb_vk_runtime.cpp`), launchers with MB's C ABI (`mb_vk_kernels.cpp`), GLSL compute shaders, `build.py` -> `libmb_vk.so` |
+| `mbvk.py`, `smolvla_vulkan.py` | ctypes binding of `libmb_vk.so`; SmolVLA end to end (vision -> KV prefix -> flow steps) on it |
 | `kb_targets.py`, `kb_bridge.py` | one KernelBlaster problem per (op type) in an IR set, built and checked with KB's own split + `cuda_env` CMake |
 | `mbir.py`, `mbabi.py` | IR loading/comparison; ctypes binding over `pipeline/kernel_abi.py` |
 | `run_level3_gpu.sh` | the GPU gates (CUDA walk + KB problems) over a directory of IRs |

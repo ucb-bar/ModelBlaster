@@ -107,11 +107,31 @@ def deploy_and_run(host: str, elf: str, remote_root: str, *,
     # launch_cpus (K3: "0-7"): the process STARTS on those CPUs. taskset sits
     # after the env assignments so MODELBLASTER_CPU still reaches the binary.
     launcher = f"taskset -c {shlex.quote(launch_cpus)} " if launch_cpus else ""
+    # MODELBLASTER_REMOTE_WRAP: a board-side wrapper (e.g. shared-board lock +
+    # idle gate + env log) put in front of the launcher.
+    _wrap = os.environ.get("MODELBLASTER_REMOTE_WRAP", "")
+    if _wrap:
+        launcher = f"{_wrap} {launcher}"
+    # MODELBLASTER_BOARD_FLOCK=<file on the board>: serialise the run with other users of a shared board.
+    _fl = os.environ.get("MODELBLASTER_BOARD_FLOCK")
+    _flock = f"flock {shlex.quote(_fl)} " if _fl else ""
     cmd = (f"chmod +x {shlex.quote(remote_bin)} && "
-           f"{prefix}{launcher}{shlex.quote(remote_bin)}")
+           f"{prefix}{_flock}{launcher}{shlex.quote(remote_bin)}")
+    # MODELBLASTER_BOARD_IDLE=<script on the board>: run it right before and after the harness, inside the
+    # board flock, its output appended to <remote_root>/idle.log (per-CPU idle record of each measurement).
+    _idle = os.environ.get("MODELBLASTER_BOARD_IDLE")
+    if _idle:
+        log = shlex.quote(f"{remote_root}/idle.log")
+        inner = (f"echo \"== {name} cpu={cpu}\" >> {log}; {shlex.quote(_idle)} >> {log} 2>&1; "
+                 f"{prefix}{launcher}{shlex.quote(remote_bin)}; rc=$?; {shlex.quote(_idle)} >> {log} 2>&1; exit $rc")
+        cmd = (f"chmod +x {shlex.quote(remote_bin)} && "
+               f"{_flock}bash -c {shlex.quote(inner)}")
+    # MODELBLASTER_LOCAL_FLOCK=<local file>: queue on a local lock first (one board waiter per session).
+    _lfl = os.environ.get("MODELBLASTER_LOCAL_FLOCK")
+    argv = (["flock", _lfl] if _lfl else []) + ["ssh", *opts, host, cmd]
     # A retry here would re-RUN the harness, so only the setup steps above
     # retry; the run itself is a single attempt on every board.
-    proc = subprocess.run(["ssh", *opts, host, cmd], capture_output=True,
+    proc = subprocess.run(argv, capture_output=True,
                           text=True, timeout=timeout)
     if proc.returncode != 0:
         # Print rather than raise: a harness that ran and then failed its own

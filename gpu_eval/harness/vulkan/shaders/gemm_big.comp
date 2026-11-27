@@ -1,0 +1,7 @@
+#version 460
+// 128 x 128 tiles: large M and N
+#define WX 16
+#define WY 16
+#define TM 8
+#define TN 8
+#include "gemm_body.glsl"

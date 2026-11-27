@@ -120,7 +120,7 @@ def test_ime_k3_a100_backend():
     ime, a100 = BACKENDS["ime_k3_a100"], BACKENDS["rvv_k3_a100"]
     assert "-march=rv64gcv_zvl1024b_zfh_zvfh" in ime.kernel_cflags
     assert not any("zvl256b" in f for f in ime.kernel_cflags)
-    assert backend_lineage("ime_k3_a100") == ("ime_k3_a100", "rvv_k3_a100", "rvv")
+    assert backend_lineage("ime_k3_a100") == ("ime_k3_a100", "rvv_k3_a100", "rvv", "rvv_f16")
     assert ime.verify_method == a100.verify_method
     assert os.path.isdir(os.path.join(REPO, "kernels", "ime_k3_a100"))
 

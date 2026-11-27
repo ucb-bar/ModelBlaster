@@ -1,0 +1,45 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int VEC = 1;   // 4: one vec4 per invocation (n % 4 == 0, 16-byte aligned)
+layout(constant_id = 1) const int OPC = 0;   // the opcode (pc.opc is ignored): one pipeline per op, no switch at run time
+// opcodes: pipeline/reference_kernels_ext.py (the CUDA mb_e1 table); 32+ are
+// the standalone CUDA activations folded in here
+layout(push_constant, scalar) uniform PC { F32 x; F32 y; int n; int opc; float p0; float p1; } pc;
+float e1(float x, int opc, float p0, float p1) {
+    switch (opc) {
+    case 0: return -x;  case 1: return exp(x);  case 2: return log(x);  case 3: return sqrt(x);
+    case 4: return inversesqrt(x);  case 5: return abs(x);  case 6: return mb_tanh(x);
+    case 7: return mb_sigmoid(x);  case 8: return x > 0.0 ? x : 0.0;
+    case 9: return sin(x);  case 10: return cos(x);  case 11: return mb_erf(x);
+    case 12: return 0.5 * x * (1.0 + mb_erf(x * 0.70710678118654752));
+    case 13: return 0.5 * x * (1.0 + mb_tanh(0.79788456080286536 * (x + 0.044715 * x * x * x)));
+    case 14: return x / (1.0 + exp(-x));  case 15: return min(max(x, p0), p1);
+    case 16: return 1.0 / x;  case 17: return x * x;
+    case 18: return x > 20.0 ? x : mb_log1p(exp(x));  case 19: return x >= 0.0 ? x : p0 * x;
+    case 20: return x > 0.0 ? x : p0 * (exp(x) - 1.0);
+    case 21: return x * min(max(x + 3.0, 0.0), 6.0) / 6.0;
+    case 22: return min(max(x / 6.0 + 0.5, 0.0), 1.0);
+    case 23: return mb_log1p(x);  case 24: return mb_expm1(x);
+    case 25: return float(int(x > 0.0) - int(x < 0.0));  case 26: return floor(x);
+    case 27: return ceil(x);  case 28: return roundEven(x);  case 29: return x == 0.0 ? 1.0 : 0.0;
+    case 31: return x * mb_tanh(x > 20.0 ? x : mb_log1p(exp(x)));
+    // standalone launchers (kernel_softplus, kernel_selu, kernel_softsign, kernel_leaky_relu)
+    case 32: return x > 0.0 ? x + mb_log1p(exp(-x)) : mb_log1p(exp(x));
+    case 33: return 1.0507009873554805 * (x > 0.0 ? x : 1.6732632423543772 * (exp(x) - 1.0));
+    case 34: return x / (1.0 + abs(x));
+    case 35: return x > 0.0 ? x : p0 * x;
+    default: return x;
+    }
+}
+void main() {
+    int i = int(MB_GID) * VEC;
+    if (i >= pc.n) return;
+    if (VEC == 4) {
+        vec4 x = MB_V4(pc.x, i), z;
+        for (int j = 0; j < 4; j++) z[j] = e1(x[j], OPC, pc.p0, pc.p1);
+        MB_V4(pc.y, i) = z;
+    } else {
+        pc.y.v[i] = e1(pc.x.v[i], OPC, pc.p0, pc.p1);
+    }
+}

@@ -1,0 +1,6 @@
+#version 460
+// linear_dq_s8_dot.comp with a 128 x 64 tile, 64 bytes of K per LDS step
+#define DOT_RM 8
+#define DOT_RN 4
+#define DOT_BKQ 16
+#include "linear_dq_s8_dot_main.glsl"

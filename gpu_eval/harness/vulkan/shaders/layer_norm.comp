@@ -1,0 +1,35 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+// One workgroup per row of [M, K]: two-pass mean / biased variance (torch).
+layout(push_constant, scalar) uniform PC { F32 x; F32 g; F32 b; F32 y; int M; int K; float eps; } pc;
+#extension GL_KHR_shader_subgroup_arithmetic : require
+shared float sv[256];
+float tree(float v) {          // workgroup sum: per subgroup, then across the subgroup partials
+    v = subgroupAdd(v);
+    if (gl_NumSubgroups == 1) return v;
+    if (subgroupElect()) sv[gl_SubgroupID] = v;
+    barrier();
+    float r = sv[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++) r += sv[i];
+    barrier();
+    return r;
+}
+void main() {
+    int row = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    if (row >= pc.M) return;
+    int base = row * pc.K, t = int(gl_LocalInvocationID.x);
+    float a = 0.0;
+    for (int k = t; k < pc.K; k += 256) a += pc.x.v[base + k];
+    float mu = tree(a) / float(pc.K);
+    float q = 0.0;
+    for (int k = t; k < pc.K; k += 256) { float d = pc.x.v[base + k] - mu; q += d * d; }
+    float inv = inversesqrt(tree(q) / float(pc.K) + pc.eps);
+    bool hg = uint64_t(pc.g) != 0ul, hb = uint64_t(pc.b) != 0ul;
+    for (int k = t; k < pc.K; k += 256) {
+        float v = (pc.x.v[base + k] - mu) * inv;
+        if (hg) v *= pc.g.v[k];
+        if (hb) v += pc.b.v[k];
+        pc.y.v[base + k] = v;
+    }
+}

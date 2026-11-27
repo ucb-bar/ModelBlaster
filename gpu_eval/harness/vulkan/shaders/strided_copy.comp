@@ -1,0 +1,22 @@
+#version 460
+#include "mb_common.glsl"
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int VEC = 1;   // 4: vec4 of the innermost dim (launcher-checked)
+// y[i] = x[off + strided(i)]; the launcher coalesced the dims, only the innermost nd are not 1
+layout(push_constant, scalar) uniform PC {
+    F32 x; F32 y; int n; int off; int d1, d2, d3, d4, d5; int s0, s1, s2, s3, s4, s5; int nd;
+} pc;
+#define DIM(D, S) { int q = r / D; o += (r - q * D) * S; r = q; }
+void main() {
+    int e = int(MB_GID) * VEC;
+    if (e >= pc.n) return;
+    int r = e, o = pc.off, nd = pc.nd;
+    DIM(pc.d5, pc.s5)
+    if (nd > 1) DIM(pc.d4, pc.s4)
+    if (nd > 2) DIM(pc.d3, pc.s3)
+    if (nd > 3) DIM(pc.d2, pc.s2)
+    if (nd > 4) DIM(pc.d1, pc.s1)
+    o += r * pc.s0;
+    if (VEC == 4) MB_V4(pc.y, e) = pc.s5 != 0 ? MB_V4(pc.x, o) : vec4(pc.x.v[o]);
+    else pc.y.v[e] = pc.x.v[o];
+}
