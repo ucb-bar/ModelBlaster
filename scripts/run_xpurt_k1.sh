@@ -204,9 +204,9 @@ SCHED_NAME="$(basename "${SCHEDULE}" .json)"
 # Absolute: build_posix.sh runs from its own directory.
 GEN_DIR="${REPO_ROOT}/${OUT_ROOT}/_gen/${SCHED_NAME}"
 BUILD_DIR="${REPO_ROOT}/${OUT_ROOT}/_build/${SCHED_NAME}"
-# xpurt_fix local change: XPURT_WALKER=static|skip|strict selects the static-program
-# walker generator (pipeline/generate_xpurt_main_static.py, ported from the
-# k3-walker-fixes branch); unset = main's own generator, unchanged.
+# XPURT_WALKER=static|skip|strict selects the static-program
+# walker generator (pipeline/generate_xpurt_main_static.py); unset = main's
+# own generator, unchanged.
 XPURT_WALKER="${XPURT_WALKER:-}"
 mkdir -p "${GEN_DIR}" "${BUILD_DIR}"
 
@@ -504,7 +504,7 @@ ${PY} -m modelblaster.pipeline.generate_xpurt_main \
     --registry "${REGISTRY}" --worker-granularity "${WORKERS}" "${DYNAMIC_ARGS[@]}" \
     ${WALKER_OPTS[@]+"${WALKER_OPTS[@]}"}
 fi
-# xpurt_fix local change: optional post-processing of the generated walker
+# Optional post-processing of the generated walker
 # (K3RT_POST_MAIN <main.c> <SCHED_NAME> <gen dir>) or a replacement main.
 if [[ -n "${K3RT_POST_MAIN:-}" ]]; then ${K3RT_POST_MAIN} "${MAIN_C}" "${SCHED_NAME}" "${GEN_DIR}"; fi
 if [[ -n "${K3RT_MAIN_OVERRIDE:-}" ]]; then MAIN_C="${K3RT_MAIN_OVERRIDE}"; fi

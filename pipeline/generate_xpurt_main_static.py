@@ -1403,7 +1403,7 @@ static int xs_init_locks_only(void)
 #ifndef MODELBLASTER_PLATFORM_LINUX
             /* Zephyr: no futex, so the default is the k_sem doorbell (an
              * event word would be spun on). Linux keeps the S7a mask +
-             * own futex word, measured cheapest (xpurt_fix Phase R). */
+             * own futex word, measured cheapest. */
             if (!k_ || !*k_) g_xs_db = 1;
 #endif
             for (int x_ = 0; x_ < XS_N_WORKERS; x_++) xs_os_db_init(&g_xs[x_].db);

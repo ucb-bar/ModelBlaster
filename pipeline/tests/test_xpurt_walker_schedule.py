@@ -281,7 +281,7 @@ class CompositeAcrossHarts(unittest.TestCase):
             c = out.read_text()
         self.assertIn(f"sched_0_harts[] = {{ {', '.join(str(h) for h in e.harts)} }};", c)
         self.assertIn(".n_harts = 3, .harts = sched_0_harts", c)
-        # xpurt_fix local change: single-hart entries also carry harts[] (static walker)
+        # Single-hart entries also carry harts[] (static walker)
         self.assertIn(".n_harts = 1, .harts = sched_1_harts", c)
 
     def test_hart_mode_reserves_harts_and_builds_composite_pools(self):

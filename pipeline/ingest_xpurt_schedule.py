@@ -416,8 +416,8 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
 
     harts_arrays: list[str] = []
     for e in entries:
-        # xpurt_fix local change: every entry gets its harts array (master
-        # first), as on the k3-walker-fixes base, because the static-program
+        # Every entry gets its harts array (master
+        # first), because the static-program
         # walker reads harts[] for single-hart entries too. Main's walker only
         # reads it when n_harts > 1, so this does not change its behaviour.
         _hs = tuple(e.harts) if len(e.harts) >= 1 else ((e.hart,) if e.hart >= 0 else ())
@@ -432,7 +432,7 @@ def emit_table(entries: list[XpurtEntry], out_path: str,
         f"#define XPURT_N_INSTANCES_{re.sub(r'[^A-Za-z0-9]', '_', n).upper()} {k}"
         for n, k in sorted(n_inst.items()))
 
-    # xpurt_fix local change: producer-side fanout (consumers of each entry, data
+    # Producer-side fanout (consumers of each entry, data
     # deps + time dep, deduplicated), for the static-program walker of
     # generate_xpurt_main_static.py. Main's own walker does not read it.
     fanout: list[list[int]] = [[] for _ in entries]
@@ -504,7 +504,7 @@ typedef struct {{
     int            time_dep_entry_id; /* cross-job ordering edge, -1 if none */
     int            n_harts;        /* harts this dispatch runs on (1 unless composite) */
     const int     *harts;          /* the n_harts harts, `hart` first; NULL if n_harts == 1 */
-    int            n_fanout;       /* xpurt_fix: consumers of this entry (static walker) */
+    int            n_fanout;       /* consumers of this entry (static walker) */
     const int     *fanout;
 }} xpurt_sched_entry_t;
 

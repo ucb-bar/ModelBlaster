@@ -26,7 +26,7 @@
  * interrupts -- the dispatch guard (arch_irq_lock for single-hart dispatches,
  * commit d4fe81e) stays as it is.
  *
- * Added 2026-11-26 (xpurt_fix study, amendment B7).
+ * Added 2026-11-26 for the static walker.
  */
 #ifndef XS_OS_H
 #define XS_OS_H
