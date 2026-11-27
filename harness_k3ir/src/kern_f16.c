@@ -930,9 +930,67 @@ static void convert(const void *src, void *dst, int64_t n, int dir)
     else k3_parallel(n, 16384, cvt_range, &c);
 }
 
-/* ---- int8 IME GEMMs with binary16 activations: kern_opt.c's kernel on fp32 views */
+void k3_f16_convert(const void *src, void *dst, int64_t n, int dir) { convert(src, dst, n, dir); }
+
+/* ---- int8 IME GEMM epilogue with binary16 outputs (called by kern_opt.c's block_epilogue, k3_f16_epi = 1).
+ * yb: [ni][NBT][TM x TN] fp32 values y = dequant(acc) (+ bias), exactly the values kern_opt.c would store in
+ * fp32. Each element leaves as fp16(addend + y) (addend widened exactly) or as addend + y in fp32 for an fp32
+ * output: the arithmetic of dq_run's fp32 view and its conversion pass, without the pass. */
+int k3_f16_epi = 1;
+static inline int epi_out(const k3_epi16 *e, int n, int *ld, int *col)
+{
+    if (n < e->N0) { *ld = e->N0; *col = n; return 0; }
+    if (n < e->N0 + e->N1) { *ld = e->N1; *col = n - e->N0; return 1; }
+    *ld = e->N2; *col = n - e->N0 - e->N1; return 2;
+}
+void k3_f16_block_store(const k3_epi16 *e, const float *yb, int ni, int mt0, int nt0)
+{
+    const int TM = e->tm, TN = e->tn, tsz = TM * TN;
+    for (int i = 0; i < ni; i++) {
+        const int mt = mt0 + i, rows = e->M - mt * TM < TM ? e->M - mt * TM : TM;
+        for (int j = 0; j < e->nbt; j++) {
+            const int n0 = (nt0 + j) * TN;
+            if (n0 >= e->N) break;
+            const float *y = yb + (size_t)(i * e->nbt + j) * tsz;
+            int ld, col, ld1, col1;
+            const int o = epi_out(e, n0, &ld, &col), o1 = epi_out(e, n0 + TN - 1, &ld1, &col1);
+            if (o == o1 && n0 + TN <= e->N) {          /* whole tile in one output: vector rows */
+                const size_t vl = __riscv_vsetvl_e32m1(TN);
+                for (int r = 0; r < rows; r++) {
+                    const size_t m = (size_t)(mt * TM + r);
+                    vfloat32m1_t v = __riscv_vle32_v_f32m1(y + r * TN, vl);
+                    if (e->addend) {
+                        vfloat32m1_t a = e->add16
+                            ? __riscv_vfwcvt_f_f_v_f32m1(__riscv_vle16_v_f16mf2((const h16 *)e->addend + m * e->N + n0, vl), vl)
+                            : __riscv_vle32_v_f32m1((const float *)e->addend + m * e->N + n0, vl);
+                        v = __riscv_vfadd_vv_f32m1(a, v, vl);
+                    }
+                    if (e->is16[o]) __riscv_vse16_v_f16mf2((h16 *)e->out[o] + m * ld + col, __riscv_vfncvt_f_f_w_f16mf2(v, vl), vl);
+                    else __riscv_vse32_v_f32m1((float *)e->out[o] + m * ld + col, v, vl);
+                }
+                continue;
+            }
+            for (int r = 0; r < rows; r++) {             /* tile straddles an output split or N */
+                const size_t m = (size_t)(mt * TM + r);
+                for (int q = 0; q < TN && n0 + q < e->N; q++) {
+                    const int n = n0 + q, oo = epi_out(e, n, &ld, &col);
+                    float v = y[r * TN + q];
+                    if (e->addend) v = (e->add16 ? (float)((const h16 *)e->addend)[m * e->N + n] : ((const float *)e->addend)[m * e->N + n]) + v;
+                    if (e->is16[oo]) ((h16 *)e->out[oo])[m * ld + col] = (h16)v;
+                    else ((float *)e->out[oo])[m * ld + col] = v;
+                }
+            }
+        }
+    }
+}
+
+/* ---- int8 IME GEMMs with binary16 activations: kern_opt.c's kernel on fp32 views (k3_f16_epi = 0, and the
+ * no-IME build), or with the fp16 block store above */
 static void dq_run(k3_graph *g, k3_op *op)
 {
+#ifndef K3_NO_IME
+    if (k3_f16_epi) { k3_opt_run(g, op); return; }
+#endif
     k3_tensor *t[K3_NIN + K3_NOUT];
     void *orig[K3_NIN + K3_NOUT];
     int nt = 0;

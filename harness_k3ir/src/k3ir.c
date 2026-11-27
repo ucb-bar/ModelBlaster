@@ -625,6 +625,7 @@ static void setup(int argc, char **argv)
     { extern int k3_vstore, k3_bpf, k3_mtail; k3_vstore = atoi(argval(argc, argv, "--vstore", "-1"));
       k3_bpf = atoi(argval(argc, argv, "--bpf", "0")); k3_mtail = argflag(argc, argv, "--mtail"); }
     k3_attn_check = argflag(argc, argv, "--attn-check");
+    { extern int k3_f16_epi; k3_f16_epi = atoi(argval(argc, argv, "--f16-epi", "1")); }
     int cpus[MAXW], n = 0;
     const char *cs = argval(argc, argv, "--cpus", NULL);
     if (cs) n = parse_cpus(cs, cpus);
@@ -759,6 +760,7 @@ static int cmd_feed(int argc, char **argv)
         }
     }
     fclose(d);
+    { extern void k3_attn_summary(void); k3_attn_summary(); }
     printf("RESULT feed_ops=%d check_mismatches=%ld\n", g.n_ops, g_check_bad);
     k3_pool_stop();
     return g_check_bad ? 1 : 0;
@@ -996,7 +998,7 @@ static int cmd_ddpm(int argc, char **argv)
     if (pon) print_prof(&G, "step", iters * steps);
     { extern void k3_attn_summary(void); k3_attn_summary(); }
     const double mstep = median(ts, nts) / 1e6, mact = median(ta, nta) / 1e6;
-    printf("RESULT ddpm windows=%d steps=%d iters=%d step_ms=%.3f action_ms=%.3f\n", nw, steps, iters, mstep, mact);
+    printf("RESULT ddpm windows=%d steps=%d iters=%d step_ms=%.3f action_ms=%.3f check_mismatches=%ld\n", nw, steps, iters, mstep, mact, g_check_bad);
     const char *outp = argval(argc, argv, "--out", NULL);
     if (outp) write_file(outp, out, n * 4 * (size_t)nw);
     k3_pool_stop();

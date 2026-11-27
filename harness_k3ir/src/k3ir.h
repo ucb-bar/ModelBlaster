@@ -94,6 +94,19 @@ int k3_op_is_f16(k3_graph *g, k3_op *op);                /* any float operand or
 int k3_f16_prepare(k3_graph *g, k3_op *op);              /* 1 if kern_f16.c takes the fp16 op */
 void k3_f16_run(k3_graph *g, k3_op *op);
 int k3_f16_exact_kind(int kind);                         /* fp16 kernels byte-identical to the reference */
+void k3_f16_convert(const void *src, void *dst, int64_t n, int dir);   /* dir 0: f16 -> f32, 1: f32 -> f16 (RNE) */
+/* int8 GEMM epilogue with binary16 outputs / addend (kern_opt.c gemm_run -> kern_f16.c): the fp32 block of
+ * dequantised (+ bias) values is stored with the addend added in fp32 and one rounding to fp16 per element,
+ * i.e. the arithmetic of the separate fp32 -> fp16 conversion pass; --f16-epi 0 restores that pass */
+extern int k3_f16_epi;
+typedef struct {
+    void *out[3];
+    int is16[3];
+    const void *addend;
+    int add16;
+    int M, N, N0, N1, N2, tm, tn, nbt;
+} k3_epi16;
+void k3_f16_block_store(const k3_epi16 *e, const float *yb, int ni, int mt0, int nt0);
 
 /* fused attention (kern_attn.c): QK^T [-> * c] [-> + mask] -> softmax -> PV chains and sdpa ops.
  * k3_attn_mode: 0 off (unfused kernels), 1 fused fp32, 3 int8 QK^T (IME, K smoothed) + u8 P x s8 V (IME) */

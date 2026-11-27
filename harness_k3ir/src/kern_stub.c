@@ -19,3 +19,7 @@ int k3_f16_prepare(k3_graph *g, k3_op *op) { (void)g; (void)op; return 0; }
 void k3_f16_run(k3_graph *g, k3_op *op) { k3_ref_run(g, op); }
 int k3_f16_exact_kind(int kind) { (void)kind; return 0; }
 int k3_hg_cfg;
+int k3_f16_epi;
+void k3_f16_convert(const void *src, void *dst, int64_t n, int dir) { (void)src; (void)dst; (void)n; (void)dir; }
+void k3_f16_block_store(const k3_epi16 *e, const float *yb, int ni, int mt0, int nt0)
+{ (void)e; (void)yb; (void)ni; (void)mt0; (void)nt0; }

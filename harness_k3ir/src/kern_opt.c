@@ -180,6 +180,7 @@ typedef struct {
     float *out[3];
     const float *addend;
     int mgroups, mper;
+    const k3_epi16 *e16;   /* binary16 output(s) or addend: the block store of kern_f16.c (NULL: all fp32) */
 } gemm_ctx;
 
 static void pack_a_range(void *vc, int64_t b0, int64_t b1, int wid)
@@ -365,6 +366,7 @@ static inline void block_epilogue(gemm_ctx *c, int32_t *cb, int mt0, int nt0, fl
     }
     if (k3_skip_epilogue == 2) return;
     if (k3_skip_epilogue == 4) return;             /* mode 3 math without the stores (timing only) */
+    if (c->e16) { k3_f16_block_store(c->e16, yb, ni, mt0, nt0); return; }
     /* Fast store: the block's 4 tiles of one m-tile land in one output as rows of NBT*TN floats (128 B on
      * the A100, 64 B on the X100). One vrgather (e64 pairs) turns [tile][row][col] into [row][tile][col],
      * and each row leaves with one vector store: no per-tile-row short stores, no scalar turnaround. */
@@ -509,6 +511,24 @@ static void gemm_run(k3_graph *g, k3_op *op)
         w->N0 = w->N; w->N1 = w->N2 = 0;
         c.out[0] = OUT(0);
         c.addend = op->kind == K_LINEAR_DQ_ADD_S8 ? IN(2) : NULL;
+    }
+    k3_epi16 e16;
+    {
+        int any = 0;
+        memset(&e16, 0, sizeof e16);
+        for (int j = 0; j < op->nout && j < 3; j++) {
+            e16.out[j] = OUT(j);
+            any |= e16.is16[j] = g->t[op->out[j]].dtype == DT_F16;
+        }
+        if (op->kind == K_LINEAR_DQ_ADD_S8) {
+            e16.addend = IN(2);
+            any |= e16.add16 = g->t[op->in[2]].dtype == DT_F16;
+        }
+        if (any) {
+            e16.M = c.M; e16.N = w->N; e16.N0 = w->N0; e16.N1 = w->N1; e16.N2 = w->N2;
+            e16.tm = TM; e16.tn = TN; e16.nbt = NBT;
+            c.e16 = &e16;
+        }
     }
     k3_parallel(c.mblk, 1, pack_a_range, &c);
     /* units: n-blocks x m-groups; enough units for every worker, n-block weights reused over the group */

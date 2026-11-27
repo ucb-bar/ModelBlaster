@@ -92,6 +92,12 @@ typedef struct {
     float *mp;                              /* [nmask][MBT][NKT][T] additive pattern (log2 domain), or [NKT][T] */
     int nmask;
     float *kt32;                            /* fp32 mode: [NB][D][N] */
+    /* binary16 operands (fp16 / mixed builds): Q, K, V, mask, O widened to fp32 views per call (exact), the
+     * fused fp32 or int8 kernel runs on the views, O rounded once to fp16. The chain's fp16 intermediates
+     * (scores, probabilities) stay fp32 inside the fused op: a numerics change held to the --attn-check
+     * bound, like the int8 modes. */
+    int f16, nh, hid[5];
+    float *hbuf[5];
 } attn_d;
 
 /* ======================================================================== matching */
@@ -183,7 +189,7 @@ static attn_d *match_chain(k3_graph *g, int i0)
     if (jb < 0) return NULL;
     k3_op *b2 = &g->ops[jb];
     const int64_t *q = b2->ip;
-    const char *pa = (const char *)g->t[b2->in[0]].data + q[5] * 4;
+    const char *pa = (const char *)g->t[b2->in[0]].data + q[5] * (int64_t)k3_esz(g->t[b2->in[0]].dtype);
     if (pa != (const char *)g->t[cur].data || q[0] != a.B0 || q[1] != a.B1 || q[2] != a.M || q[3] != a.N ||
         q[9] != 1 || q[8] != a.N || (a.B1 > 1 && q[7] != (int64_t)a.M * a.N) ||
         (a.B0 > 1 && q[6] != (int64_t)a.B1 * a.M * a.N) || q[14] != 1 || q[19] != 1)
@@ -291,6 +297,18 @@ int k3_attn_fuse(k3_graph *g)
         a->mode = 1;
 #endif
         geometry(a);
+        {
+            const int ids[5] = {a->qt, a->kt, a->vt, a->mt, a->ot};
+            for (int k = 0; k < 5; k++) {
+                if (ids[k] < 0 || g->t[ids[k]].dtype != DT_F16) continue;
+                int dup = 0;
+                for (int h = 0; h < a->nh; h++) dup |= a->hid[h] == ids[k];
+                if (dup) continue;
+                a->hid[a->nh] = ids[k];
+                a->hbuf[a->nh++] = xalloc(sizeof(float) * (size_t)g->t[ids[k]].nelem);
+            }
+            a->f16 = a->nh > 0;
+        }
         for (int e = 0; e < a->nops; e++) a->oimpl[e] = g->ops[a->ops[e]].impl;
         for (int e = 0; e < a->nops - 1; e++) g->ops[a->ops[e]].impl = 2;
         k3_op *h = &g->ops[a->ops[a->nops - 1]];
@@ -308,8 +326,8 @@ void k3_attn_report(k3_graph *g, const char *tag)
         if (g->ops[i].impl == 3) {
             attn_d *a = g->ops[i].prep.wpack;
             if (first)
-                printf("ATTN %s mode=%d B=%dx%d M=%d N=%d D=%d DV=%d scale=%g mask=%d shared=%d ops=", tag, a->mode,
-                       a->B0, a->B1, a->M, a->N, a->D, a->DV, a->scale, a->mt >= 0, a->mask_shared);
+                printf("ATTN %s mode=%d B=%dx%d M=%d N=%d D=%d DV=%d scale=%g mask=%d shared=%d f16=%d ops=", tag, a->mode,
+                       a->B0, a->B1, a->M, a->N, a->D, a->DV, a->scale, a->mt >= 0, a->mask_shared, a->f16);
             if (first) for (int e = 0; e < a->nops; e++) printf("%s%s", e ? "," : "", k3_kind_names[g->ops[a->ops[e]].kind]);
             if (first) printf("\n");
             first = 0;
@@ -857,7 +875,28 @@ static void i8_unit(void *vc, int64_t u0, int64_t u1, int wid)
 #endif
 
 /* ======================================================================== run */
+static void attn_run32(k3_graph *g, k3_op *op);
 void k3_attn_run(k3_graph *g, k3_op *op)
+{
+    attn_d *a = op->prep.wpack;
+    if (!a->f16) { attn_run32(g, op); return; }
+    void *orig[5];
+    for (int h = 0; h < a->nh; h++) {             /* O too: elements the chain does not write round-trip exactly */
+        k3_tensor *t = &g->t[a->hid[h]];
+        orig[h] = t->data;
+        k3_f16_convert(t->data, a->hbuf[h], t->nelem, 0);
+        t->data = a->hbuf[h];
+        t->dtype = DT_F32;
+    }
+    attn_run32(g, op);
+    for (int h = 0; h < a->nh; h++) {
+        k3_tensor *t = &g->t[a->hid[h]];
+        if (a->hid[h] == a->ot) k3_f16_convert(t->data, orig[h], t->nelem, 1);
+        t->data = orig[h];
+        t->dtype = DT_F16;
+    }
+}
+static void attn_run32(k3_graph *g, k3_op *op)
 {
     tiles();
     attn_d *a = op->prep.wpack;
@@ -894,13 +933,22 @@ void k3_attn_verify(k3_graph *g, k3_op *op)
 {
     attn_d *a = op->prep.wpack;
     k3_tensor *ot = &g->t[a->ot];
-    const size_t nb = (size_t)ot->nelem * 4;
-    float *fused = malloc(nb), *o = ot->data;
-    memcpy(fused, o, nb);
+    const int h16 = ot->dtype == DT_F16;
+    const size_t nb = (size_t)ot->nelem * k3_esz(ot->dtype);
+    void *fused_raw = malloc(nb);
+    memcpy(fused_raw, ot->data, nb);
     for (int e = 0; e < a->nops; e++) {          /* the unfused chain, original kernels */
         k3_op *c = &g->ops[a->ops[e]];
-        if (a->oimpl[e]) k3_opt_run(g, c);
+        if (a->oimpl[e] == 5) k3_f16_run(g, c);
+        else if (a->oimpl[e]) k3_opt_run(g, c);
         else k3_ref_run(g, c);
+    }
+    float *fused = fused_raw, *o = ot->data;
+    if (h16) {                                     /* compare in fp32 (exact widening) */
+        fused = malloc(sizeof(float) * (size_t)ot->nelem);
+        o = malloc(sizeof(float) * (size_t)ot->nelem);
+        k3_f16_convert(fused_raw, fused, ot->nelem, 0);
+        k3_f16_convert(ot->data, o, ot->nelem, 0);
     }
     /* compare only the elements the chain writes: rows of O (B0 x B1 x M rows of DV) */
     double mx = 0, me = 0, se = 0, sr = 0;
@@ -919,8 +967,9 @@ void k3_attn_verify(k3_graph *g, k3_op *op)
     if (rel > g_worst_rel) g_worst_rel = rel;
     if (l2 > g_worst_l2) g_worst_l2 = l2;
     g_nverify++;
-    memcpy(o, fused, nb);                          /* downstream sees the fused result */
-    free(fused);
+    memcpy(ot->data, fused_raw, nb);               /* downstream sees the fused result */
+    if (h16) { free(fused); free(o); }
+    free(fused_raw);
 }
 
 void k3_attn_summary(void)
