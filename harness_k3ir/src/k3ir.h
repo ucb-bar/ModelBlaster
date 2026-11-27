@@ -46,7 +46,9 @@ typedef struct k3_op {
     double fp[K3_NFP];
     const void *wp[K3_NW];        /* resolved weight pointers (NULL when absent) */
     k3_prep prep;
-    int impl;                     /* 0 = reference, 1 = optimised */
+    int cl;                       /* pool (cluster) that prepares and runs the op: 0 main, 1 --cpus2 */
+    int impl;                     /* 0 = reference, 1 = optimised, 2 = fused into an earlier op (skipped),
+                                     3 = fused attention head op (kern_attn.c) */
 } k3_op;
 
 typedef struct {
@@ -56,6 +58,7 @@ typedef struct {
     int *inputs, *outputs;
     uint8_t *wblob, *cblob;
     int64_t wbytes, cbytes;
+    uint64_t *prof;               /* per-op ns accumulated under --prof (NULL when off) */
 } k3_graph;
 
 static inline size_t k3_esz(int dt) { return dt == DT_I8 ? 1 : 4; }
@@ -67,6 +70,8 @@ int k3_pool_start(const int *cpus, int n);      /* worker 0 = calling thread, pl
 int k3_pool_size(void);
 void k3_parallel(int64_t nunits, int64_t grain, k3_range_fn fn, void *ctx);
 void k3_pool_stop(void);
+int k3_pool2_start(const int *cpus, int n);     /* second pool on the other cluster, own leader thread */
+void k3_remote(int pool, void (*fn)(void *), void *arg);
 
 /* backends ---------------------------------------------------------------- */
 enum { BK_REF = 0, BK_A100 = 1, BK_X100 = 2 };
@@ -76,6 +81,20 @@ extern int k3_opt_mask;             /* bit per kind: 1 = use optimised kernel wh
 void k3_ref_run(k3_graph *g, k3_op *op);                 /* reference (scalar C) kernels */
 int k3_opt_prepare(k3_graph *g, k3_op *op);              /* 1 if an optimised kernel takes the op */
 void k3_opt_run(k3_graph *g, k3_op *op);
+
+/* fused attention (kern_attn.c): QK^T [-> * c] [-> + mask] -> softmax -> PV chains and sdpa ops.
+ * k3_attn_mode: 0 off (unfused kernels), 1 fused fp32, 3 int8 QK^T (IME, K smoothed) + u8 P x s8 V (IME) */
+extern int k3_attn_mode;
+extern int k3_rowq_mode;                                 /* --fuse-rowq: row op + quantize_rows_s8 (impl 4) */
+int k3_rowq_fuse(k3_graph *g);
+void k3_rowq_run(k3_graph *g, k3_op *op);
+int k3_attn_fuse(k3_graph *g);                           /* marks chains; returns the number fused */
+void k3_attn_run(k3_graph *g, k3_op *op);
+void k3_attn_report(k3_graph *g, const char *tag);       /* fused groups, for the log */
+
+/* shared fp32 RVV GEMM (kern_opt.c): C[m, n] (+)= sum_k A[m*lda + k] B[k*ldb + n], rows [m0, m1) */
+void k3_sgemm_rows(const float *A, int64_t lda, const float *B, int64_t ldb, float *C, int64_t ldc, int m0, int m1,
+                   int K, int N, const float *bias, int accumulate);
 
 static inline uint64_t k3_now_ns(void)
 {

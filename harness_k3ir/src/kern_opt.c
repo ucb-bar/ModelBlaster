@@ -38,12 +38,15 @@ __asm__(".macro k3_vmadot_s8 vd, vs1, vs2\n"
 #define VMADOT(c, a, b) __asm__ volatile("k3_vmadot_s8 %0, %1, %2" : "+vr"(c) : "vr"(a), "vr"(b))
 #endif
 
-static size_t g_vlenb;
-static int TM, TN, TK;               /* IME tile */
+/* tile geometry follows the executing thread's cluster (vlenb): thread-local, so two pools on the two
+ * clusters can run in one process */
+static __thread size_t g_vlenb;
+static __thread int TM, TN, TK;
+extern int k3_vstore, k3_bpf, k3_mtail;               /* IME tile */
 
 #define NBT 4  /* n-tiles per block */
 #define MBT 2  /* m-tiles per block */
-static uint16_t g_perm[256];
+static __thread uint16_t g_perm[256];
 int k3_vperm = -1;   /* -1: auto (X100 only; vrgather is slow on the A100) */
 
 static void init_tiles(void)
@@ -115,6 +118,7 @@ static void par(int64_t n, int64_t work, k3_range_fn fn, void *ctx)
 typedef struct {
     int8_t *bp;            /* packed weights */
     double *wsp;           /* [nblocks*NBT][TM*TN] w_scale pattern (col = idx % TN) */
+    float *wsp32;          /* the same pattern in fp32 (epilogue mode 3) */
     float *bip;            /* [nblocks*NBT][TM*TN] bias pattern, NULL if no bias */
     int N, K, Np, Kp, nblk;
     int N0, N1, N2;        /* output split (linear3) */
@@ -124,6 +128,7 @@ static int gemm_prepare(k3_op *op, int N, int K)
 {
     init_tiles();
     if (!TM) return 0;
+    if (k3_vstore < 0) k3_vstore = TM == 8;
     gemm_w *w = calloc(1, sizeof(gemm_w));
     const int nbw = NBT * TN;
     w->N = N;
@@ -149,11 +154,13 @@ static int gemm_prepare(k3_op *op, int N, int K)
     const float *ws = op->wp[2], *bias = op->wp[1];
     const int ntl = w->nblk * NBT, tsz = TM * TN;
     w->wsp = xalloc(sizeof(double) * (size_t)ntl * tsz);
+    w->wsp32 = xalloc(sizeof(float) * (size_t)ntl * tsz);
     if (bias) w->bip = xalloc(sizeof(float) * (size_t)ntl * tsz);
     for (int t = 0; t < ntl; t++)
         for (int e = 0; e < tsz; e++) {
             const int n = t * TN + e % TN;
             w->wsp[(size_t)t * tsz + e] = n < N ? (double)ws[n] : 0.0;
+            w->wsp32[(size_t)t * tsz + e] = n < N ? ws[n] : 0.0f;
             if (bias) w->bip[(size_t)t * tsz + e] = n < N ? bias[n] : 0.0f;
         }
     op->prep.wpack = w;
@@ -168,6 +175,7 @@ typedef struct {
     const float *rs;
     int8_t *ap;            /* packed activations */
     double *rsp;           /* [mtiles][TM*TN] row-scale pattern (row = idx / TN) */
+    float *rsp32;          /* [mtiles][TM*TN] the same in fp32, one copy per m-tile (epilogue mode 3) */
     int M, Mp, mblk, ks;
     float *out[3];
     const float *addend;
@@ -176,6 +184,7 @@ typedef struct {
 
 static void pack_a_range(void *vc, int64_t b0, int64_t b1, int wid)
 {
+    init_tiles();
     (void)wid;
     gemm_ctx *c = vc;
     const int K = c->w->K, tt = TM * TK;
@@ -208,6 +217,8 @@ static void pack_a_range(void *vc, int64_t b0, int64_t b1, int wid)
                 rp[e] = m < c->M ? (double)c->rs[m] : 0.0;
             }
             for (int j = 1; j < NBT; j++) memcpy(rp + j * tsz, rp, sizeof(double) * tsz);
+            float *rq = c->rsp32 + (size_t)mt * tsz * 2;      /* two copies: one m4 chunk = 2 tiles */
+            for (int e = 0; e < tsz; e++) rq[e] = rq[e + tsz] = (float)rp[e];
         }
     }
 }
@@ -227,6 +238,7 @@ static inline void copy_row(float *d, const float *s, int n, int even)
     }
 }
 
+extern int k3_vstore;
 static inline void store_tile(gemm_ctx *c, float *y, int mt, int nt)
 {
     gemm_w *w = c->w;
@@ -239,6 +251,15 @@ static inline void store_tile(gemm_ctx *c, float *y, int mt, int nt)
     else if (n0 >= w->N0 + w->N1 && n0 + TN <= w->N) { dst = c->out[2]; ld = w->N2; col = n0 - w->N0 - w->N1; }
     else dst = NULL;                                       /* tile straddles an output split or N */
     const int rows = c->M - mt * TM < TM ? c->M - mt * TM : TM;
+    if (dst && k3_vstore) {        /* vector row copies: no scalar reads of vector-written data (slow on the A100) */
+        const size_t vl = __riscv_vsetvl_e32m1(TN);
+        for (int r = 0; r < rows; r++) {
+            vfloat32m1_t v = __riscv_vle32_v_f32m1(y + r * TN, vl);
+            if (c->addend) v = __riscv_vfadd_vv_f32m1(__riscv_vle32_v_f32m1(c->addend + (size_t)(mt * TM + r) * w->N + n0, vl), v, vl);
+            __riscv_vse32_v_f32m1(dst + (size_t)(mt * TM + r) * ld + col, v, vl);
+        }
+        return;
+    }
     if (dst) {
         const int even = !(ld & 1) && !(col & 1);
         if (c->addend) {                                   /* gather the addend tile, one vector add */
@@ -270,6 +291,9 @@ static inline void store_tile(gemm_ctx *c, float *y, int mt, int nt)
  * on every write-allocate miss of a 32-byte tile row otherwise. Issued before the K loop, so the
  * misses overlap the vmadots. */
 int k3_prefetch = 0;   /* measured: no gain on the A100 */
+int k3_vstore = -1;
+int k3_bpf = 0;        /* --bpf N: prefetch.r the weight stream N k-slabs ahead (first m-block of a unit) */
+int k3_mtail = 0;      /* --mtail: one-m-tile K loop when the block's second m-tile is all padding */    /* -1 auto: on for the A100 (TM == 8); --vstore 0/1 */
 int k3_cbozero = 1;
 int k3_skip_epilogue;
 static inline void prefetch_block(gemm_ctx *c, int mt0, int nt0)
@@ -304,6 +328,26 @@ static inline void block_epilogue(gemm_ctx *c, int32_t *cb, int mt0, int nt0, fl
     const int tsz = TM * TN, n4 = NBT * tsz;
     const int ni = (mt0 + 1) * TM < c->M ? 2 : 1;
     if (k3_skip_epilogue == 1) return;
+    if (k3_skip_epilogue == 3 || k3_skip_epilogue == 4) {
+        /* exact as above: (double)rs * (double)ws is formed by a widening fp32 multiply (exact: 24 + 24 bits
+         * < 53), from fp32 patterns (half the bytes); the column-scale and bias chunks are loaded once for
+         * both m-tiles. Byte-identical to the mode-0 epilogue. */
+        const float *bp = w->bip ? w->bip + (size_t)nt0 * tsz : NULL, *wq = w->wsp32 + (size_t)nt0 * tsz;
+        for (int e = 0; e < n4;) {
+            size_t vl = __riscv_vsetvl_e32m4(n4 - e);
+            vfloat32m4_t wv = __riscv_vle32_v_f32m4(wq + e, vl), bv;
+            if (bp) bv = __riscv_vle32_v_f32m4(bp + e, vl);
+            for (int i = 0; i < ni; i++) {
+                const float *rq = c->rsp32 + (size_t)(mt0 + i) * tsz * 2;
+                vfloat64m8_t sc = __riscv_vfwmul_vv_f64m8(__riscv_vle32_v_f32m4(rq + (e % (2 * tsz)), vl), wv, vl);
+                vfloat64m8_t a = __riscv_vfwcvt_f_x_v_f64m8(__riscv_vle32_v_i32m4(cb + i * n4 + e, vl), vl);
+                vfloat32m4_t y = __riscv_vfncvt_f_f_w_f32m4(__riscv_vfmul_vv_f64m8(a, sc, vl), vl);
+                if (bp) y = __riscv_vfadd_vv_f32m4(y, bv, vl);
+                __riscv_vse32_v_f32m4(yb + i * n4 + e, y, vl);
+            }
+            e += (int)vl;
+        }
+    } else
     for (int i = 0; i < ni; i++) {
         const int32_t *ci = cb + i * n4;
         const double *rp = c->rsp + (size_t)(mt0 + i) * n4, *wp = w->wsp + (size_t)nt0 * tsz;
@@ -320,6 +364,7 @@ static inline void block_epilogue(gemm_ctx *c, int32_t *cb, int mt0, int nt0, fl
         }
     }
     if (k3_skip_epilogue == 2) return;
+    if (k3_skip_epilogue == 4) return;             /* mode 3 math without the stores (timing only) */
     /* Fast store: the block's 4 tiles of one m-tile land in one output as rows of NBT*TN floats (128 B on
      * the A100, 64 B on the X100). One vrgather (e64 pairs) turns [tile][row][col] into [row][tile][col],
      * and each row leaves with one vector store: no per-tile-row short stores, no scalar turnaround. */
@@ -371,6 +416,7 @@ static inline void block_epilogue(gemm_ctx *c, int32_t *cb, int mt0, int nt0, fl
 
 static void gemm_range(void *vc, int64_t u0, int64_t u1, int wid)
 {
+    init_tiles();
     (void)wid;
     gemm_ctx *c = vc;
     gemm_w *w = c->w;
@@ -388,8 +434,23 @@ static void gemm_range(void *vc, int64_t u0, int64_t u1, int wid)
             vint32m2_t c00 = __riscv_vmv_v_x_i32m2(0, vl32), c01 = c00, c02 = c00, c03 = c00;
             vint32m2_t c10 = c00, c11 = c00, c12 = c00, c13 = c00;
             const int8_t *ap = abase, *bp = bbase;
-            for (int s = 0; s < ks; s++, ap += MBT * tt, bp += NBT * tt) {
+            const int pf = k3_bpf && mb == mb0, half = k3_mtail && (mb * MBT + 1) * TM >= c->M;
+            if (half) {                 /* second m-tile all padding (e.g. M = 50 on the A100): 4 vmadots per slab */
+                for (int s = 0; s < ks; s++, ap += MBT * tt, bp += NBT * tt) {
+                    size_t vl8 = __riscv_vsetvl_e8m1(tt);
+                    if (pf) for (int o = 0; o < NBT * tt; o += 64) __asm__ volatile("prefetch.r 0(%0)" ::"r"(bp + k3_bpf * NBT * tt + o));
+                    vint8m1_t a0 = __riscv_vle8_v_i8m1(ap, vl8);
+                    vint8m1_t b0 = __riscv_vle8_v_i8m1(bp, vl8), b1 = __riscv_vle8_v_i8m1(bp + tt, vl8);
+                    vint8m1_t b2 = __riscv_vle8_v_i8m1(bp + 2 * tt, vl8), b3 = __riscv_vle8_v_i8m1(bp + 3 * tt, vl8);
+                    VMADOT(c00, a0, b0);
+                    VMADOT(c01, a0, b1);
+                    VMADOT(c02, a0, b2);
+                    VMADOT(c03, a0, b3);
+                }
+            }
+            for (int s = half ? ks : 0; s < ks; s++, ap += MBT * tt, bp += NBT * tt) {
                 size_t vl8 = __riscv_vsetvl_e8m1(tt);
+                if (pf) for (int o = 0; o < NBT * tt; o += 64) __asm__ volatile("prefetch.r 0(%0)" ::"r"(bp + k3_bpf * NBT * tt + o));
                 vint8m1_t a0 = __riscv_vle8_v_i8m1(ap, vl8), a1 = __riscv_vle8_v_i8m1(ap + tt, vl8);
                 vint8m1_t b0 = __riscv_vle8_v_i8m1(bp, vl8), b1 = __riscv_vle8_v_i8m1(bp + tt, vl8);
                 VMADOT(c00, a0, b0);
@@ -422,6 +483,7 @@ static void gemm_range(void *vc, int64_t u0, int64_t u1, int wid)
 
 static void gemm_run(k3_graph *g, k3_op *op)
 {
+    init_tiles();
 #ifdef K3_NO_IME
     k3_ref_run(g, op);
 #else
@@ -439,6 +501,7 @@ static void gemm_run(k3_graph *g, k3_op *op)
     c.Mp = c.mblk * mbr;
     c.ap = shared_scratch(0, (size_t)c.Mp * w->Kp);
     c.rsp = shared_scratch(1, sizeof(double) * (size_t)c.mblk * MBT * TM * TN * NBT);
+    c.rsp32 = shared_scratch(3, sizeof(float) * (size_t)c.mblk * MBT * TM * TN * 2);
     if (op->kind == K_LINEAR3_DQ_S8) {
         w->N0 = (int)P(2); w->N1 = (int)P(3); w->N2 = (int)P(4);
         c.out[0] = OUT(0); c.out[1] = OUT(1); c.out[2] = op->nout > 2 ? OUT(2) : NULL;
@@ -501,8 +564,9 @@ static void qrows_range(void *vc, int64_t m0, int64_t m1, int wid)
 
 /* ======================================================================== fp32 GEMM */
 /* C[m, n] (+)= sum_k A[m*lda + k] * B[k*ldb + n], row-major, rows m in [m0, m1), all N */
-static void sgemm_rows(const float *A, int64_t lda, const float *B, int64_t ldb, float *C, int64_t ldc, int m0,
-                       int m1, int K, int N, const float *bias, int accumulate)
+#define sgemm_rows k3_sgemm_rows
+void k3_sgemm_rows(const float *A, int64_t lda, const float *B, int64_t ldb, float *C, int64_t ldc, int m0,
+                   int m1, int K, int N, const float *bias, int accumulate)
 {
     for (int n0 = 0; n0 < N;) {
         size_t vl = __riscv_vsetvl_e32m2(N - n0);
@@ -1190,6 +1254,64 @@ static void scopy_range(void *vc, int64_t r0, int64_t r1, int wid)
     }
 }
 
+
+/* ======================================================================== row op + quantize_rows_s8 */
+/* A norm or elementwise op whose output is read by the next op, a quantize_rows_s8 over the same rows:
+ * one pass per chunk of rows (producer rows, then their quantisation while they are in L1), one pool
+ * dispatch instead of two. The producer output is still written, so later readers are unaffected, and both
+ * halves run the same code as the separate kernels: byte-identical results. */
+int k3_rowq_mode = 0;
+
+static int rowq_producer(k3_op *op)
+{
+    switch (op->kind) {
+    case K_LAYER_NORM: case K_RMS_NORM: case K_SILU_MUL: case K_GELU_EXACT: case K_GELU: case K_SILU: case K_MUL:
+    case K_ADD: case K_RELU: case K_SIGMOID: case K_TANH: return 1;
+    case K_EWISE1: return P(0) == 14;
+    default: return 0;
+    }
+}
+
+int k3_rowq_fuse(k3_graph *g)
+{
+    int n = 0;
+    if (!k3_rowq_mode) return 0;
+    for (int i = 0; i + 1 < g->n_ops; i++) {
+        k3_op *op = &g->ops[i], *q = &g->ops[i + 1];
+        if (op->impl != 1 || q->impl != 1 || q->kind != K_QUANTIZE_ROWS_S8 || !rowq_producer(op)) continue;
+        if (g->t[q->in[0]].data != g->t[op->out[0]].data || g->t[q->in[0]].nelem != g->t[op->out[0]].nelem) continue;
+        const int64_t M = q->ip[0], K = q->ip[1];
+        if (op->kind == K_LAYER_NORM || op->kind == K_RMS_NORM) { if (op->ip[0] != M || op->ip[1] != K) continue; }
+        else if ((op->kind == K_EWISE1 ? op->ip[1] : op->ip[0]) != M * K) continue;
+        op->impl = 4;
+        op->prep.npad = i + 1;          /* index of the fused quantize op */
+        q->impl = 2;
+        n++, i++;
+    }
+    return n;
+}
+
+typedef struct { k3_graph *g; k3_op *op, *q; int64_t K, rows; } rowq_ctx;
+static void rowq_range(void *vc, int64_t m0, int64_t m1, int wid)
+{
+    rowq_ctx *c = vc;
+    opctx pc = {c->g, c->op}, qc = {c->g, c->q};
+    const int norm = c->op->kind == K_LAYER_NORM || c->op->kind == K_RMS_NORM;
+    for (int64_t m = m0; m < m1; m += c->rows) {
+        const int64_t e = m + c->rows < m1 ? m + c->rows : m1;
+        if (norm) norm_range(&pc, m, e, wid);
+        else ewise_range(&pc, m * c->K, e * c->K, wid);
+        qrows_range(&qc, m, e, wid);
+    }
+}
+
+void k3_rowq_run(k3_graph *g, k3_op *op)
+{
+    k3_op *q = &g->ops[op->prep.npad];
+    rowq_ctx c = {g, op, q, q->ip[1], 0};
+    c.rows = 16384 / (4 * c.K) > 1 ? 16384 / (4 * c.K) : 1;
+    par(q->ip[0], q->ip[0] * q->ip[1], rowq_range, &c);
+}
 
 /* ======================================================================== dispatch */
 int k3_opt_prepare(k3_graph *g, k3_op *op)

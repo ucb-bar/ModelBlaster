@@ -14,11 +14,11 @@ build/k3ir_host: $(SRCS) src/kern_stub.c src/k3ir.h
 	mkdir -p build && gcc $(COMMON) -o $@ $(SRCS) src/kern_stub.c -lm -lpthread
 
 k3: build/k3ir_k3
-build/k3ir_k3: $(SRCS) src/kern_opt.c src/k3ir.h
+build/k3ir_k3: $(SRCS) src/kern_opt.c src/kern_attn.c src/k3ir.h
 	mkdir -p build && $(CROSS)gcc $(COMMON) -march=rv64gcv_zicbop_zicboz -mabi=lp64d -static -DMODELBLASTER_PLATFORM_LINUX \
-	  -DMODELBLASTER_AI_CPUS=\"8-15\" -o $@ $(SRCS) src/kern_opt.c $(RT)/mb_placement.c -lm -lpthread
+	  -DMODELBLASTER_AI_CPUS=\"8-15\" -o $@ $(SRCS) src/kern_opt.c src/kern_attn.c $(RT)/mb_placement.c -lm -lpthread
 
 spike: build/k3ir_spike
-build/k3ir_spike: $(SRCS) src/kern_opt.c src/k3ir.h
+build/k3ir_spike: $(SRCS) src/kern_opt.c src/kern_attn.c src/k3ir.h
 	mkdir -p build && $(CROSS)gcc $(COMMON) -march=rv64gcv_zicbop_zicboz -mabi=lp64d -static -DK3_NO_IME \
-	  -o $@ $(SRCS) src/kern_opt.c -lm -lpthread
+	  -o $@ $(SRCS) src/kern_opt.c src/kern_attn.c -lm -lpthread
