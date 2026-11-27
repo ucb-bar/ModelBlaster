@@ -599,7 +599,7 @@ def get_int8_mixed_policy():
     return env or dict(INT8_POLICY[_part()])
 
 
-def load_policy(img: int = 256, model_id: str = "lerobot/smolvla_base"):
+def load_policy(img: int = 256, model_id: str = os.environ.get("MB_SMOLVLA_MODEL", "lerobot/smolvla_base")):  # fine-tuned checkpoint path from the environment
     """lerobot SmolVLAPolicy in fp32 on the CPU, all weights from the policy checkpoint
     (load_vlm_weights=False: the SmolVLM2 backbone is built from its config only)."""
     from lerobot.configs.policies import PreTrainedConfig

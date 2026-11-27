@@ -445,6 +445,17 @@ def _bmm_strided(ir, op, ins, dev):
 OPS["bmm_strided"] = _bmm_strided
 
 
+def _im2col(ir, op, ins, dev):
+    """pipeline/int8_mixed.conv_as_linear's im2col: [1, IC, IH, IW] -> [OH*OW, IC*KH*KW] (F.unfold order)."""
+    sh = op["shape"]
+    c = F.unfold(ins[0].reshape(1, sh["IC"], sh["IH"], sh["IW"]), (sh["KH"], sh["KW"]),
+                 dilation=(sh["DH"], sh["DW"]), padding=(sh["PH"], sh["PW"]), stride=(sh["SH"], sh["SW"]))
+    return [c[0].t().contiguous()]
+
+
+OPS["im2col"] = _im2col
+
+
 def _attention(ir, op, ins, dev):
     """attention_fuse's fused attention (reference_kernels_ext.ATTENTION): EXACT fp32 math (no rounding of the
     scores / probabilities; walk rounds the output once), rows in chunks so the score matrix stays ~1 GB."""

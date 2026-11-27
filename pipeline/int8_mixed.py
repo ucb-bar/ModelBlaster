@@ -306,7 +306,49 @@ def _r_rope_half(ir, op, ins):
     return [torch.cat([x1 * c - x2 * s_, x2 * c + x1 * s_], dim=-1)]
 
 
-TORCH_RULES = {"quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "linear3_dq_s8": _r_linear3_dq,
+def _r_im2col(ir, op, ins):
+    sh = op["shape"]
+    x = ins[0].reshape(1, sh["IC"], sh["IH"], sh["IW"]).float()
+    c = torch.nn.functional.unfold(x, (sh["KH"], sh["KW"]), dilation=(sh["DH"], sh["DW"]),
+                                   padding=(sh["PH"], sh["PW"]), stride=(sh["SH"], sh["SW"]))
+    return [c[0].t().contiguous()]
+
+
+def conv_as_linear(ir):
+    """fp32 IR -> the same graph with every ungrouped, batch-1 conv2d as im2col [OH*OW, IC*KH*KW] + linear
+    (the conv weight as [OC, IC*KH*KW], its bias) + a transpose back to NCHW (strided_copy), so the int8
+    policy quantizes convs like any linear (dynamic per-pixel-row int8 activations, per-channel weights).
+    Value-preserving up to fp32 summation order."""
+    g = json.loads(json.dumps(ir.graph))
+    T, W = g["tensors"], dict(ir.weights)
+    ops = []
+    for op in g["ops"]:
+        sh = op.get("shape", {})
+        if op["op"] != "conv2d" or sh.get("N", 1) != 1 or sh.get("G", 1) != 1:
+            ops.append(op)
+            continue
+        IC, OC, KH, KW = sh["IC"], sh["OC"], sh["KH"], sh["KW"]
+        OHW, KK = sh["OH"] * sh["OW"], IC * KH * KW
+        n, y = op["name"], op["outputs"][0]
+        col, lin = f"{y}__col", f"{y}__lin"
+        T[col] = {"shape": [OHW, KK], "dtype": "f32", "quant": None}
+        T[lin] = {"shape": [OHW, OC], "dtype": "f32", "quant": None}
+        wk = f"{op['weight']}.as_linear"
+        W[wk] = np.ascontiguousarray(np.asarray(ir.weights[op["weight"]], np.float32).reshape(OC, KK))
+        csh = {k: sh.get(k, 1 if k in ("DH", "DW") else 0) for k in
+               ("IC", "IH", "IW", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "DH", "DW")}
+        ops.append({"name": f"{n}__im2col", "op": "im2col", "inputs": [op["inputs"][0]], "outputs": [col],
+                    "shape": csh, "hardware_target": "any"})
+        ops.append({"name": n, "op": "linear", "inputs": [col], "outputs": [lin], "weight": wk,
+                    "bias": op.get("bias"), "shape": {"M": OHW, "K": KK, "N": OC}, "hardware_target": "any"})
+        ops.append({"name": f"{n}__nchw", "op": "strided_copy", "inputs": [lin], "outputs": [y],
+                    "shape": {"off": 0, "d0": 1, "d1": 1, "d2": 1, "d3": 1, "d4": OC, "d5": OHW,
+                              "s0": 0, "s1": 0, "s2": 0, "s3": 0, "s4": 1, "s5": OC}, "hardware_target": "any"})
+    g["ops"] = ops
+    return as_ir(g, W, ir.golden_in, ir.golden_out)
+
+
+TORCH_RULES = {"im2col": _r_im2col, "quantize_rows_s8": _r_quantize_rows, "linear_dq_s8": _r_linear_dq, "linear3_dq_s8": _r_linear3_dq,
                "linear_dq_add_s8": _r_linear_dq_add, "rope_half": _r_rope_half, "silu_mul": _r_silu_mul}
 
 
@@ -417,6 +459,8 @@ def quantize_graph(ir, samples: list[dict], policy="linear") -> tuple[dict, dict
     """fp32 IR (mbir.IR) + calibration samples ({input name: tensor}) -> (graph, weights, report)
     of the int8_mixed IR. The fp32 IR is not modified."""
     pol = resolve_policy(policy)
+    if pol.get("conv_as_linear"):
+        ir = conv_as_linear(ir)
     alpha = float(pol["alpha"])
     keep = [str(p) for p in pol["keep_fp32"]]
     sel = [op for op in ir.ops if op["op"] in pol["int8_kinds"]

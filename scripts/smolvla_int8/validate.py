@@ -29,7 +29,7 @@ ap.add_argument("--threads", type=int, default=12)
 a = ap.parse_args()
 torch.set_num_threads(a.threads)
 f32 = {p: load_ir(f"{a.root}/{p}") for p in PARTS}
-cal = {p: [M.inputs_of(f32[p], s) for s in torch.load(f"{a.cal}/cal_{p}.pt")] for p in PARTS}
+cal = {} if a.mode == "irs" else {p: [M.inputs_of(f32[p], s) for s in torch.load(f"{a.cal}/cal_{p}.pt")] for p in PARTS}  # irs mode needs no calibration dump
 obs_files = []
 for g in (a.obs or [f"{a.cal}/obs/eval0.pt", f"{a.cal}/obs14/*.pt", f"{a.cal}/heldout/*.pt"]):
     obs_files += sorted(glob.glob(g))
