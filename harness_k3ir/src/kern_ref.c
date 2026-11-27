@@ -212,7 +212,7 @@ static void bmm_strided(const float *a, const float *b, float *c, const int64_t 
                 }
 }
 
-void k3_ref_run(k3_graph *g, k3_op *op)
+static void ref_run32(k3_graph *g, k3_op *op)
 {
     switch (op->kind) {
     case K_STRIDED_COPY:
@@ -529,8 +529,227 @@ void k3_ref_run(k3_graph *g, k3_op *op)
             }
         break;
     }
+    case K_MAXPOOL2D: {               /* NCHW, padding never wins (-inf), floor output size */
+        const int64_t NC = P(0) * P(1), IH = P(2), IW = P(3), OH = P(4), OW = P(5), KH = P(6), KW = P(7),
+                      SH = P(8), SW = P(9), PH = P(10), PW = P(11), DH = P(12), DW = P(13);
+        const float *x = IN(0);
+        float *y = OUT(0);
+        for (int64_t c = 0; c < NC; c++)
+            for (int64_t oh = 0; oh < OH; oh++)
+                for (int64_t ow = 0; ow < OW; ow++) {
+                    float m = -INFINITY;
+                    for (int64_t kh = 0; kh < KH; kh++) {
+                        const int64_t ih = oh * SH - PH + kh * DH;
+                        if (ih < 0 || ih >= IH) continue;
+                        for (int64_t kw = 0; kw < KW; kw++) {
+                            const int64_t iw = ow * SW - PW + kw * DW;
+                            if (iw < 0 || iw >= IW) continue;
+                            const float v = x[(c * IH + ih) * IW + iw];
+                            m = v > m ? v : m;
+                        }
+                    }
+                    y[(c * OH + oh) * OW + ow] = m;
+                }
+        break;
+    }
+    case K_GATHER: {                  /* y[i] = idx[i] >= 0 ? x[idx[i]] : 0 (explicit padding), any element size */
+        const size_t es = k3_esz(g->t[op->in[0]].dtype);
+        const uint8_t *x = IN(0);
+        const int32_t *idx = IN(1);
+        uint8_t *y = OUT(0);
+        for (int64_t i = 0; i < P(0); i++) {
+            if (idx[i] >= 0) memcpy(y + i * es, x + (size_t)idx[i] * es, es);
+            else memset(y + i * es, 0, es);
+        }
+        break;
+    }
+    case K_STRIDED_SCATTER: {         /* y = x0; y[off + sum i_k s_k] = x1 (box d0..d5, row-major), any element size */
+        const size_t es = k3_esz(g->t[op->in[0]].dtype);
+        const int64_t *d = op->ip + 1, *st = op->ip + 7;
+        const uint8_t *x1 = IN(1);
+        uint8_t *y = OUT(0);
+        if (y != (uint8_t *)IN(0)) memcpy(y, IN(0), (size_t)P(13) * es);
+        size_t o = 0;
+        for (int64_t i0 = 0; i0 < d[0]; i0++)
+            for (int64_t i1 = 0; i1 < d[1]; i1++)
+                for (int64_t i2 = 0; i2 < d[2]; i2++)
+                    for (int64_t i3 = 0; i3 < d[3]; i3++)
+                        for (int64_t i4 = 0; i4 < d[4]; i4++)
+                            for (int64_t i5 = 0; i5 < d[5]; i5++, o++) {
+                                const int64_t b = P(0) + i0 * st[0] + i1 * st[1] + i2 * st[2] + i3 * st[3] + i4 * st[4] + i5 * st[5];
+                                memcpy(y + b * es, x1 + o * es, es);
+                            }
+        break;
+    }
+    case K_CONV2D_GROUPED: {          /* NCHW, weight [OC, IC/G, KH, KW] */
+        const int64_t N = P(0), IC = P(1), IH = P(2), IW = P(3), OC = P(4), OH = P(5), OW = P(6), KH = P(7),
+                      KW = P(8), SH = P(9), SW = P(10), PH = P(11), PW = P(12), DH = P(13), DW = P(14), G = P(15);
+        const int64_t icg = IC / G, ocg = OC / G;
+        const float *x = IN(0), *w = op->wp[0], *b = op->wp[1];
+        float *y = OUT(0);
+        for (int64_t n = 0; n < N; n++)
+            for (int64_t oc = 0; oc < OC; oc++)
+                for (int64_t oh = 0; oh < OH; oh++)
+                    for (int64_t ow = 0; ow < OW; ow++) {
+                        const int64_t gi = oc / ocg;
+                        float acc = 0.0f;
+                        for (int64_t c = 0; c < icg; c++) {
+                            const int64_t ic = gi * icg + c;
+                            for (int64_t kh = 0; kh < KH; kh++) {
+                                const int64_t ih = oh * SH - PH + kh * DH;
+                                if (ih < 0 || ih >= IH) continue;
+                                for (int64_t kw = 0; kw < KW; kw++) {
+                                    const int64_t iw = ow * SW - PW + kw * DW;
+                                    if (iw < 0 || iw >= IW) continue;
+                                    acc += x[((n * IC + ic) * IH + ih) * IW + iw] * w[((oc * icg + c) * KH + kh) * KW + kw];
+                                }
+                            }
+                        }
+                        y[((n * OC + oc) * OH + oh) * OW + ow] = b ? acc + b[oc] : acc;
+                    }
+        break;
+    }
+    case K_CUMSUM: {
+        const int64_t outer = P(0), A = P(1), inner = P(2);
+        const float *x = IN(0);
+        float *y = OUT(0);
+        for (int64_t o = 0; o < outer; o++)
+            for (int64_t i = 0; i < inner; i++) {
+                float acc = 0.0f;
+                for (int64_t a = 0; a < A; a++) {
+                    acc += x[(o * A + a) * inner + i];
+                    y[(o * A + a) * inner + i] = acc;
+                }
+            }
+        break;
+    }
+    case K_REDUCE: {                  /* opc 0 sum, 1 mean, 2 max, 3 min, 5 sum of squares, 6 l2 norm */
+        const int64_t outer = P(0), R = P(1), inner = P(2), opc = P(3);
+        const float *x = IN(0);
+        float *y = OUT(0);
+        for (int64_t o = 0; o < outer; o++)
+            for (int64_t i = 0; i < inner; i++) {
+                float acc = opc == 2 ? -INFINITY : opc == 3 ? INFINITY : 0.0f;
+                for (int64_t r = 0; r < R; r++) {
+                    const float v = x[(o * R + r) * inner + i];
+                    if (opc == 2) acc = v > acc ? v : acc;
+                    else if (opc == 3) acc = v < acc ? v : acc;
+                    else if (opc == 5 || opc == 6) acc += v * v;
+                    else acc += v;
+                }
+                if (opc == 1) acc = acc / (float)R;
+                if (opc == 6) acc = sqrtf(acc);
+                if (opc == 4 || opc > 6) { fprintf(stderr, "reduce: opcode %lld not implemented\n", (long long)opc); exit(3); }
+                y[o * inner + i] = acc;
+            }
+        break;
+    }
+    case K_UPSAMPLE_NEAREST: {        /* [NC, IH, IW] -> [NC, OH, OW], src = floor(dst * IH / OH) (torch 'nearest') */
+        const int64_t NC = P(0), IH = P(1), IW = P(2), OH = P(3), OW = P(4);
+        const size_t es = k3_esz(g->t[op->in[0]].dtype);
+        const uint8_t *x = IN(0);
+        uint8_t *y = OUT(0);
+        for (int64_t c = 0; c < NC; c++)
+            for (int64_t oh = 0; oh < OH; oh++) {
+                const int64_t ih = oh * IH / OH;
+                for (int64_t ow = 0; ow < OW; ow++)
+                    memcpy(y + ((c * OH + oh) * OW + ow) * es, x + ((c * IH + ih) * IW + ow * IW / OW) * es, es);
+            }
+        break;
+    }
     default:
         fprintf(stderr, "k3ir: no reference kernel for kind %s\n", k3_kind_names[op->kind]);
         exit(3);
+    }
+}
+
+/* ---- fp16 storage (ModelBlaster's _f16 contract) -------------------------------------------------
+ * An fp16 op runs its fp32 reference kernel on exactly widened copies of its binary16 inputs and weights;
+ * each binary16 output is rounded once (round-to-nearest-even) from the kernel's fp32 result. Copies
+ * (strided_copy, catn, index_select, upsample) move binary16 elements as they are; casts convert. */
+int k3_op_is_f16(k3_graph *g, k3_op *op)
+{
+    if (op->ip[K3_IP_WF16]) return 1;
+    for (int j = 0; j < op->nin; j++)
+        if (g->t[op->in[j]].dtype == DT_F16) return 1;
+    for (int j = 0; j < op->nout; j++)
+        if (g->t[op->out[j]].dtype == DT_F16) return 1;
+    return 0;
+}
+
+static void cast_ref(k3_graph *g, k3_op *op)
+{
+    const k3_tensor *a = &g->t[op->in[0]], *b = &g->t[op->out[0]];
+    const int64_t n = P(0);
+    if (a->dtype == DT_F16 && b->dtype == DT_F32) {
+        const _Float16 *x = a->data;
+        float *y = b->data;
+        for (int64_t i = 0; i < n; i++) y[i] = (float)x[i];
+    } else if (a->dtype == DT_F32 && b->dtype == DT_F16) {
+        const float *x = a->data;
+        _Float16 *y = b->data;
+        for (int64_t i = 0; i < n; i++) y[i] = (_Float16)x[i];
+    } else {
+        memcpy(b->data, a->data, (size_t)n * k3_esz(a->dtype));
+    }
+}
+
+void k3_ref_run(k3_graph *g, k3_op *op)
+{
+    if (op->kind == K_CAST) { cast_ref(g, op); return; }
+    if (!op->f16 || op->kind == K_STRIDED_COPY || op->kind == K_CATN || op->kind == K_INDEX_SELECT ||
+        op->kind == K_UPSAMPLE_NEAREST || op->kind == K_GATHER || op->kind == K_STRIDED_SCATTER) {
+        ref_run32(g, op);
+        return;
+    }
+    int ids[K3_NIN + K3_NOUT], isout[K3_NIN + K3_NOUT], nid = 0;
+    void *orig[K3_NIN + K3_NOUT];
+    for (int pass = 0; pass < 2; pass++) {
+        const int n = pass ? op->nout : op->nin;
+        for (int j = 0; j < n; j++) {
+            const int id = pass ? op->out[j] : op->in[j];
+            k3_tensor *t = &g->t[id];
+            int seen = 0;
+            for (int q = 0; q < nid; q++) seen |= ids[q] == id;
+            if (seen || t->dtype != DT_F16) continue;
+            float *b = malloc((size_t)t->nelem * 4 + 64);
+            if (!pass) {
+                const _Float16 *h = t->data;
+                for (int64_t i = 0; i < t->nelem; i++) b[i] = (float)h[i];
+            }
+            ids[nid] = id;
+            isout[nid] = pass;
+            orig[nid] = t->data;
+            t->data = b;
+            t->dtype = DT_F32;
+            nid++;
+        }
+    }
+    for (int j = 0; j < op->nout; j++)                 /* an output that is also an input is written too */
+        for (int q = 0; q < nid; q++) isout[q] |= ids[q] == op->out[j];
+    const void *wsave[K3_NW];
+    for (int j = 0; j < K3_NW; j++) {
+        wsave[j] = op->wp[j];
+        if (!((op->ip[K3_IP_WF16] >> j) & 1) || !op->wp[j]) continue;
+        if (!op->wf32[j]) {
+            const int64_t n = op->ip[K3_IP_WN + j];
+            const _Float16 *h = op->wp[j];
+            op->wf32[j] = malloc((size_t)n * 4 + 64);
+            for (int64_t i = 0; i < n; i++) op->wf32[j][i] = (float)h[i];
+        }
+        op->wp[j] = op->wf32[j];
+    }
+    ref_run32(g, op);
+    for (int j = 0; j < K3_NW; j++) op->wp[j] = wsave[j];
+    for (int q = 0; q < nid; q++) {
+        k3_tensor *t = &g->t[ids[q]];
+        float *b = t->data;
+        if (isout[q]) {
+            _Float16 *h = orig[q];
+            for (int64_t i = 0; i < t->nelem; i++) h[i] = (_Float16)b[i];
+        }
+        t->data = orig[q];
+        t->dtype = DT_F16;
+        free(b);
     }
 }

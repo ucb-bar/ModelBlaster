@@ -12,7 +12,7 @@
 #define K3_NFP 4
 #define K3_OPW (3 + K3_NIN + K3_NOUT + K3_NW + K3_NIP + K3_NFP)
 
-enum { DT_F32 = 0, DT_I8 = 1, DT_I32 = 2 };
+enum { DT_F32 = 0, DT_I8 = 1, DT_I32 = 2, DT_F16 = 3 };
 enum { TK_BUF = 0, TK_CONST = 1, TK_ALIAS = 2 };
 
 enum {
@@ -20,7 +20,9 @@ enum {
     K_RMS_NORM, K_ROPE_HALF, K_SILU_MUL, K_GELU_EXACT, K_LINEAR, K_BMM_STRIDED, K_CONV2D, K_INDEX_SELECT,
     K_QUANTIZE_ROWS_S8, K_LINEAR_DQ_S8, K_LINEAR3_DQ_S8, K_LINEAR_DQ_ADD_S8, K_GELU, K_EWISE_SCALAR,
     K_SILU, K_RELU, K_MATMUL, K_LAYER_NORM_NOAFFINE, K_ATTENTION, K_SOFTMAX_DIM, K_MEAN_DIM, K_SUM_DIM,
-    K_SOFTPLUS, K_TANH, K_MUL, K_SDPA, K_CONV_T2D, K_SIGMOID, K_IM2COL, K_NKINDS
+    K_SOFTPLUS, K_TANH, K_MUL, K_SDPA, K_CONV_T2D, K_SIGMOID, K_IM2COL,
+    K_CAST, K_MAXPOOL2D, K_UPSAMPLE_NEAREST, K_GATHER, K_CONV2D_GROUPED, K_CUMSUM, K_STRIDED_SCATTER, K_REDUCE,
+    K_NKINDS
 };
 extern const char *k3_kind_names[K_NKINDS];
 
@@ -48,8 +50,15 @@ typedef struct k3_op {
     k3_prep prep;
     int cl;                       /* pool (cluster) that prepares and runs the op: 0 main, 1 --cpus2 */
     int impl;                     /* 0 = reference, 1 = optimised, 2 = fused into an earlier op (skipped),
-                                     3 = fused attention head op (kern_attn.c) */
+                                     3 = fused attention head op (kern_attn.c), 4 = row op + quantize (kern_opt.c),
+                                     5 = optimised fp16 (kern_f16.c) */
+    int f16;                      /* fp16 storage op: some float tensor or weight of it is DT_F16 */
+    float *wf32[K3_NW];           /* reference kernels: fp16 weights widened once (exact) */
 } k3_op;
+/* fp16 ops (f16_ir.py, ModelBlaster's _f16 contract): ip[K3_IP_WN + j] = element count of weight j,
+ * bit j of ip[K3_IP_WF16] set when weight j is stored as binary16 */
+#define K3_IP_WN 32
+#define K3_IP_WF16 39
 
 typedef struct {
     int n_tensors, n_ops, n_in, n_out;
@@ -61,7 +70,7 @@ typedef struct {
     uint64_t *prof;               /* per-op ns accumulated under --prof (NULL when off) */
 } k3_graph;
 
-static inline size_t k3_esz(int dt) { return dt == DT_I8 ? 1 : 4; }
+static inline size_t k3_esz(int dt) { return dt == DT_I8 ? 1 : dt == DT_F16 ? 2 : 4; }
 static inline void *k3_ptr(k3_graph *g, int id) { return g->t[id].data; }
 
 /* thread pool ------------------------------------------------------------- */
@@ -81,6 +90,10 @@ extern int k3_opt_mask;             /* bit per kind: 1 = use optimised kernel wh
 void k3_ref_run(k3_graph *g, k3_op *op);                 /* reference (scalar C) kernels */
 int k3_opt_prepare(k3_graph *g, k3_op *op);              /* 1 if an optimised kernel takes the op */
 void k3_opt_run(k3_graph *g, k3_op *op);
+int k3_op_is_f16(k3_graph *g, k3_op *op);                /* any float operand or weight in binary16 */
+int k3_f16_prepare(k3_graph *g, k3_op *op);              /* 1 if kern_f16.c takes the fp16 op */
+void k3_f16_run(k3_graph *g, k3_op *op);
+int k3_f16_exact_kind(int kind);                         /* fp16 kernels byte-identical to the reference */
 
 /* fused attention (kern_attn.c): QK^T [-> * c] [-> + mask] -> softmax -> PV chains and sdpa ops.
  * k3_attn_mode: 0 off (unfused kernels), 1 fused fp32, 3 int8 QK^T (IME, K smoothed) + u8 P x s8 V (IME) */

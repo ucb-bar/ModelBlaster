@@ -31,12 +31,14 @@ KINDS = ["view", "strided_copy", "catn", "ewise1", "ewise2", "mul_scalar", "add"
          "rms_norm", "rope_half", "silu_mul", "gelu_exact", "linear", "bmm_strided", "conv2d", "index_select",
          "quantize_rows_s8", "linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8", "gelu", "ewise_scalar",
          "silu", "relu", "matmul", "layer_norm_noaffine", "attention", "softmax_dim", "mean_dim", "sum_dim",
-         "softplus", "tanh", "mul", "sdpa", "conv_transpose2d", "sigmoid", "im2col"]
+         "softplus", "tanh", "mul", "sdpa", "conv_transpose2d", "sigmoid", "im2col",
+         "cast", "maxpool2d", "upsample_nearest", "gather", "conv2d_grouped", "cumsum", "strided_scatter", "reduce"]
 KID = {k: i for i, k in enumerate(KINDS)}
 NIN, NOUT, NW, NIP, NFP = 8, 4, 6, 40, 4
 OPW = 3 + NIN + NOUT + NW + NIP + NFP
-DT = {"f32": 0, "i8": 1, "i32": 2, "i64": 2, "u8": 1, "b8": 1}
-ESZ = {0: 4, 1: 1, 2: 4}
+DT = {"f32": 0, "i8": 1, "i32": 2, "i64": 2, "u8": 1, "b8": 1, "f16": 3}
+ESZ = {0: 4, 1: 1, 2: 4, 3: 2}
+IP_WN, IP_WF16 = 32, 39     # fp16 ops: weight element counts, binary16-weight bitmask (k3ir.h)
 
 
 def _f64bits(x: float) -> int:
@@ -84,6 +86,8 @@ def pack(ir_dir: str, out: str) -> dict:
                 arr, dt = arr.astype(np.int32), 2
             elif arr.dtype == np.int8 or arr.dtype == np.uint8 or arr.dtype == bool:
                 arr, dt = arr.astype(np.int8), 1
+            elif arr.dtype == np.float16:              # an fp16 op's constant (f16_ir.py)
+                dt = 3
             else:
                 arr, dt = arr.astype(np.float32), 0
             assert arr.size == nel(n), (n, arr.shape, T[n]["shape"])
@@ -91,17 +95,27 @@ def pack(ir_dir: str, out: str) -> dict:
         else:
             trec.append([dt, 0, nel(n), 0, 0])
 
+    wmeta = {}                                     # blob offset -> (elements, binary16)
+
     def wofs(key, dtype=np.float32):
         if key is None:
             return -1
         arr = W[key]
+        if arr.dtype == np.float16 and dtype == np.float32:     # an fp16 op's weight (f16_ir.py) stays binary16
+            dtype = np.float16
         if dtype is not None:
             arr = arr.astype(dtype)
-        return blob.add(arr)
+        off = blob.add(arr)
+        wmeta[off] = (int(arr.size), arr.dtype == np.float16)
+        return off
 
     ops = []
     for op in g["ops"]:
         k = op["op"]
+        if k in ("cast_f32_to_f16", "cast_f16_to_f32"):
+            k = "cast"
+        elif k.endswith("_f16"):                   # fp16 storage: the tensors' and weights' dtypes say so
+            k = k[:-4]
         sh = op.get("shape", {})
         ins = [tid[t] for t in op["inputs"]]
         outs = [tid[t] for t in op["outputs"]]
@@ -174,9 +188,9 @@ def pack(ir_dir: str, out: str) -> dict:
             keys = ["N", "IC", "IH", "IW", "OC", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "DH", "DW", "G"]
             ip[:16] = [sh.get(x, 1 if x in ("DH", "DW", "N", "G") else 0) for x in keys]
             w[0], w[1] = wofs(op["weight"]), wofs(op.get("bias"))
-        elif k == "conv2d":
-            keys = ["N", "IC", "IH", "IW", "OC", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "DH", "DW"]
-            ip[:15] = [sh.get(x, 1 if x in ("DH", "DW", "N") else 0) for x in keys]
+        elif k in ("conv2d", "conv2d_grouped"):
+            keys = ["N", "IC", "IH", "IW", "OC", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "DH", "DW", "G"]
+            ip[:16] = [sh.get(x, 1 if x in ("DH", "DW", "N", "G") else 0) for x in keys]
             w[0], w[1] = wofs(op["weight"]), wofs(op.get("bias"))
         elif k == "index_select":
             ip[:4] = [sh["outer"], sh["A"], sh["J"], sh["inner"]]
@@ -202,6 +216,32 @@ def pack(ir_dir: str, out: str) -> dict:
             fp[0] = op["scale"]
         elif k in ("softmax_dim", "mean_dim", "sum_dim"):
             ip[:3] = [sh["outer"], sh.get("R", sh.get("reduce")), sh["inner"]]
+        elif k == "gather":
+            ip[0] = nel(op["outputs"][0])
+            it = op["inputs"][1]
+            if T[it].get("const") and trec[tid[it]][0] != 2:     # float-valued indices -> int32 (-1: zero)
+                arr = W[T[it]["const"]].astype(np.int64).astype(np.int32)
+                trec[tid[it]] = [2, 1, arr.size, cblob.add(arr), 0]
+        elif k == "cumsum":
+            ip[:3] = [sh["outer"], sh["axis"], sh["inner"]]
+        elif k == "strided_scatter":
+            ip[:14] = [sh["off"]] + [sh[f"d{i}"] for i in range(6)] + [sh[f"s{i}"] for i in range(6)] + [sh["n"]]
+        elif k == "reduce":
+            ip[:4] = [sh["outer"], sh["R"], sh["inner"], op["opc"]]
+        elif k == "cast":
+            ip[0] = nel(op["outputs"][0])
+            assert nel(op["inputs"][0]) == ip[0], op["name"]
+        elif k == "maxpool2d":
+            keys = ["N", "C", "IH", "IW", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "DH", "DW"]
+            ip[:14] = [sh.get(x, 1 if x in ("N", "DH", "DW") else 0) for x in keys]
+        elif k == "upsample_nearest":
+            ip[:5] = [sh.get("N", 1) * sh["C"], sh["IH"], sh["IW"], sh.get("OH", sh["IH"] * sh.get("scale", 1)),
+                      sh.get("OW", sh["IW"] * sh.get("scale", 1))]
+        for j in range(NW):
+            if w[j] >= 0:
+                n_el, h = wmeta[w[j]]
+                ip[IP_WN + j] = n_el
+                ip[IP_WF16] |= (1 << j) if h else 0
         assert len(ins) <= NIN and len(outs) <= NOUT, op["name"]
         rec = [KID[k], len(ins), len(outs)] + ins + [-1] * (NIN - len(ins)) + outs + [-1] * (NOUT - len(outs))
         rec += w + [int(x) for x in ip] + [_f64bits(x) for x in fp]
@@ -228,7 +268,8 @@ def pack(ir_dir: str, out: str) -> dict:
         wh.update(p)
     names = {"ir": str(d), "tensors": list(T), "ops": [n for n, _ in ops], "op_kinds": [KINDS[r[0]] for _, r in ops],
              "inputs": in_names, "outputs": out_names, "wblob_sha1": wh.hexdigest(),
-             "shapes": {n: T[n]["shape"] for n in T}, "dtypes": {n: T[n].get("dtype", "f32") for n in T}}
+             "shapes": {n: T[n]["shape"] for n in T}, "dtypes": {n: T[n].get("dtype", "f32") for n in T},
+             "producer": {list(T)[i]: KINDS[r[0]] for _, r in ops for i in r[3 + NIN:3 + NIN + NOUT] if i >= 0}}
     Path(out + ".names.json").write_text(json.dumps(names))
     return {"ops": len(ops), "tensors": len(trec), "wblob_mb": blob.size / 1e6, "cblob_mb": cblob.size / 1e6,
             "wblob_sha1": wh.hexdigest()}

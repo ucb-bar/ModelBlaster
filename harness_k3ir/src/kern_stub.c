@@ -15,3 +15,7 @@ void k3_rowq_run(k3_graph *g, k3_op *op) { (void)g; (void)op; }
 int k3_vstore;
 int k3_bpf, k3_mtail;
 int k3_attn_i8_min;
+int k3_f16_prepare(k3_graph *g, k3_op *op) { (void)g; (void)op; return 0; }
+void k3_f16_run(k3_graph *g, k3_op *op) { k3_ref_run(g, op); }
+int k3_f16_exact_kind(int kind) { (void)kind; return 0; }
+int k3_hg_cfg;

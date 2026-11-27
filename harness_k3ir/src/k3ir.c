@@ -30,7 +30,8 @@ const char *k3_kind_names[K_NKINDS] = {
     "rms_norm", "rope_half", "silu_mul", "gelu_exact", "linear", "bmm_strided", "conv2d", "index_select",
     "quantize_rows_s8", "linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8", "gelu", "ewise_scalar",
     "silu", "relu", "matmul", "layer_norm_noaffine", "attention", "softmax_dim", "mean_dim", "sum_dim",
-    "softplus", "tanh", "mul", "sdpa", "conv_transpose2d", "sigmoid", "im2col"};
+    "softplus", "tanh", "mul", "sdpa", "conv_transpose2d", "sigmoid", "im2col",
+    "cast", "maxpool2d", "upsample_nearest", "gather", "conv2d_grouped", "cumsum", "strided_scatter", "reduce"};
 
 int k3_backend = BK_REF;
 int k3_opt_mask = -1;
@@ -359,7 +360,7 @@ typedef struct { k3_graph *g; k3_op *op; int r; } prep_arg;
 static void prep_one(void *a_)
 {
     prep_arg *a = a_;
-    a->r = k3_opt_prepare(a->g, a->op);
+    a->r = a->op->f16 ? (k3_f16_prepare(a->g, a->op) ? 5 : 0) : k3_opt_prepare(a->g, a->op);
 }
 static void fuse_attn(void *g) { k3_attn_fuse(g); }
 static void prepare_tag(k3_graph *g, const char *tag)
@@ -369,6 +370,7 @@ static void prepare_tag(k3_graph *g, const char *tag)
         k3_op *op = &g->ops[i];
         op->impl = 0;
         op->cl = g_place_ops ? is_gemm_kind(op->kind) : gp;
+        op->f16 = k3_op_is_f16(g, op);
         if (k3_backend != BK_REF && ((k3_opt_mask >> op->kind) & 1)) {
             prep_arg a = {g, op, 0};
             k3_remote(op->cl, prep_one, &a);        /* packed layouts follow the owning cluster's vlenb */
@@ -471,11 +473,13 @@ static void run_op_here(k3_graph *g, k3_op *op, int idx)
         if (k3_attn_check) { extern void k3_attn_verify(k3_graph *, k3_op *); k3_attn_verify(g, op); }
     } else if (op->impl == 4) {
         k3_rowq_run(g, op);
-    } else if (op->impl) k3_opt_run(g, op);
+    } else if (op->impl == 5) k3_f16_run(g, op);
+    else if (op->impl) k3_opt_run(g, op);
     else k3_ref_run(g, op);
     if (g_prof_on) g->prof[idx] += k3_now_ns() - t0;
     if (g_check && op->impl == 4) check_op(g, &g->ops[op->prep.npad], op->prep.npad);
-    if (g_check && op->impl && is_s8_kind(op->kind)) check_op(g, op, idx);
+    if (g_check && ((op->impl == 1 && is_s8_kind(op->kind)) || (op->impl == 5 && k3_f16_exact_kind(op->kind))))
+        check_op(g, op, idx);
 }
 
 static void run_graph(k3_graph *g)
@@ -540,12 +544,19 @@ static void print_prof(k3_graph *g, const char *tag, int iters)
         tot += g->prof[i] / (double)iters;
     }
     printf("PROF_BEGIN %s total_ms=%.3f\n", tag, tot / 1e6);
+    {
+        double kf[K_NKINDS] = {0};
+        for (int i = 0; i < g->n_ops; i++)
+            if (g->ops[i].f16 && g->ops[i].impl != 2) kf[g->ops[i].impl == 3 ? K_ATTENTION : g->ops[i].kind] += g->prof[i] / (double)iters;
+        for (int k = 0; k < K_NKINDS; k++)
+            if (kf[k] > 0) printf("PROF_KIND_F16 %s %s ms=%.3f\n", tag, k3_kind_names[k], kf[k] / 1e6);
+    }
     for (int k = 0; k < K_NKINDS; k++)
         if (kn[k]) printf("PROF_KIND %s %s n=%d ms=%.3f pct=%.1f\n", tag, k3_kind_names[k], kn[k], kt[k] / 1e6,
                           100 * kt[k] / tot);
     for (int i = 0; i < g->n_ops; i++)
-        printf("PROF_OP %s %d %s impl=%d us=%.1f\n", tag, i, k3_kind_names[g->ops[i].kind], g->ops[i].impl,
-               g->prof[i] / (double)iters / 1e3);
+        printf("PROF_OP %s %d %s impl=%d f16=%d us=%.1f\n", tag, i, k3_kind_names[g->ops[i].kind], g->ops[i].impl,
+               g->ops[i].f16, g->prof[i] / (double)iters / 1e3);
     printf("PROF_END %s\n", tag);
 }
 
@@ -600,7 +611,8 @@ static void setup(int argc, char **argv)
     k3_skip_epilogue = argflag(argc, argv, "--no-epilogue") ? 1 : atoi(argval(argc, argv, "--epi-mode", "0"));
     k3_prefetch = argflag(argc, argv, "--prefetch");
     k3_cbozero = !argflag(argc, argv, "--no-cbozero");
-    extern int k3_vperm;
+    extern int k3_vperm, k3_hg_cfg;
+    k3_hg_cfg = atoi(argval(argc, argv, "--hg-cfg", "0"));
     k3_vperm = argflag(argc, argv, "--no-vperm") ? 0 : argflag(argc, argv, "--vperm") ? 1 : -1;
     k3_attn_mode = atoi(argval(argc, argv, "--attn", "0"));
     k3_pool_mode = atoi(argval(argc, argv, "--pool", "0"));
@@ -640,12 +652,14 @@ static int cmd_run(int argc, char **argv)
     const int iters = atoi(argval(argc, argv, "--iters", "5")), warm = atoi(argval(argc, argv, "--warm", "1"));
     int64_t n;
     uint8_t *in = read_file(argval(argc, argv, "--in", NULL), &n);
-    if (n == 0 || (size_t)n % in_bytes(&g)) {
-        fprintf(stderr, "k3ir: input is %lld bytes, graph wants a multiple of %zu\n", (long long)n, in_bytes(&g));
+    if (!n || (size_t)n % in_bytes(&g)) {
+        fprintf(stderr, "k3ir: input is %lld bytes, graph wants (a multiple of) %zu\n", (long long)n, in_bytes(&g));
         return 2;
     }
     const int nrec = (int)((size_t)n / in_bytes(&g));
-    if (nrec > 1) {           /* --in holds several records: each runs once, the outputs are concatenated */
+        if (nrec > 1 && !argval(argc, argv, "--iters", NULL)) {
+        /* several records and no --iters (k3-kernopt): each record runs once, the outputs are concatenated;
+         * with --iters (k3-fp16): latency on the first record, then the outputs of all */
         uint8_t *o = malloc(out_bytes(&g) * nrec);
         uint64_t *tr = calloc(nrec, 8);
         for (int r = 0; r < nrec; r++) {
@@ -680,10 +694,16 @@ static int cmd_run(int argc, char **argv)
            median(wall, iters) / 1e6, mn / 1e6, mx / 1e6, iters, g_check_bad);
     const char *outp = argval(argc, argv, "--out", NULL);
     if (outp) {
-        uint8_t *o = malloc(out_bytes(&g));
+        uint8_t *o = malloc(out_bytes(&g) * (size_t)nrec);
         get_outputs(&g, o);
-        write_file(outp, o, out_bytes(&g));
+        for (int r = 1; r < nrec; r++) {
+            set_inputs(&g, in + (size_t)r * in_bytes(&g));
+            run_graph(&g);
+            get_outputs(&g, o + (size_t)r * out_bytes(&g));
+        }
+        write_file(outp, o, out_bytes(&g) * (size_t)nrec);
     }
+    if (nrec > 1) printf("RESULT_RECORDS %d\n", nrec);
     k3_pool_stop();
     return g_check_bad ? 1 : 0;
 }
@@ -863,9 +883,10 @@ static int cmd_bench(int argc, char **argv)
     k3_graph g = {0};
     g.n_tensors = 4;
     g.t = calloc(4, sizeof(k3_tensor));
-    int f32 = !strcmp(kind, "linear");
+    int f16 = !strcmp(kind, "linear_f16");
+    int f32 = !strcmp(kind, "linear") || f16;
     int64_t ne[4] = {(int64_t)M * K, M, (int64_t)M * N, 0};
-    int dt[4] = {f32 ? DT_F32 : DT_I8, DT_F32, DT_F32, DT_F32};
+    int dt[4] = {f16 ? DT_F16 : f32 ? DT_F32 : DT_I8, DT_F32, f16 ? DT_F16 : DT_F32, DT_F32};
     for (int i = 0; i < 3; i++) {
         g.t[i].dtype = dt[i];
         g.t[i].nelem = ne[i];
@@ -874,7 +895,11 @@ static int cmd_bench(int argc, char **argv)
     srand(1);
     int8_t *x = g.t[0].data;
     float *xf = g.t[0].data;
-    for (int64_t i = 0; i < ne[0]; i++) { if (f32) xf[i] = (rand() % 255 - 127) / 64.0f; else x[i] = (int8_t)(rand() % 255 - 127); }
+    for (int64_t i = 0; i < ne[0]; i++) {
+        if (f16) ((_Float16 *)xf)[i] = (_Float16)((rand() % 255 - 127) / 64.0f);
+        else if (f32) xf[i] = (rand() % 255 - 127) / 64.0f;
+        else x[i] = (int8_t)(rand() % 255 - 127);
+    }
     for (int i = 0; i < M; i++) ((float *)g.t[1].data)[i] = 1e-3f * (1 + rand() % 100);
     k3_op op = {0};
     op.kind = f32 ? K_LINEAR : K_LINEAR_DQ_S8;
@@ -884,15 +909,29 @@ static int cmd_bench(int argc, char **argv)
     op.ip[0] = M; op.ip[1] = K; op.ip[2] = N;
     void *w = aligned_alloc(64, (size_t)N * K * 4 + 64);
     float *ws = malloc(4 * (size_t)N), *b = malloc(4 * (size_t)N);
-    for (int64_t i = 0; i < (int64_t)N * K; i++) { if (f32) ((float *)w)[i] = (rand() % 255 - 127) / 64.0f; else ((int8_t *)w)[i] = (int8_t)(rand() % 255 - 127); }
-    for (int i = 0; i < N; i++) { ws[i] = 1e-3f * (1 + rand() % 100); b[i] = 0.01f * (rand() % 100); }
+    for (int64_t i = 0; i < (int64_t)N * K; i++) {
+        if (f16) ((_Float16 *)w)[i] = (_Float16)((rand() % 255 - 127) / 64.0f);
+        else if (f32) ((float *)w)[i] = (rand() % 255 - 127) / 64.0f;
+        else ((int8_t *)w)[i] = (int8_t)(rand() % 255 - 127);
+    }
+    for (int i = 0; i < N; i++) {
+        ws[i] = 1e-3f * (1 + rand() % 100);
+        b[i] = 0.01f * (rand() % 100);
+        if (f16) ((_Float16 *)b)[i] = (_Float16)b[i];
+    }
     op.wp[0] = w; op.wp[1] = b; op.wp[2] = ws;
+    if (f16) {
+        op.ip[K3_IP_WN] = (int64_t)N * K;
+        op.ip[K3_IP_WN + 1] = N;
+        op.ip[K3_IP_WF16] = 3;
+        op.f16 = 1;
+    }
     setup(argc, argv);
-    op.impl = k3_backend != BK_REF ? k3_opt_prepare(&g, &op) : 0;
+    op.impl = k3_backend == BK_REF ? 0 : f16 ? (k3_f16_prepare(&g, &op) ? 5 : 0) : k3_opt_prepare(&g, &op);
     uint64_t *t = calloc(iters, 8);
     for (int i = -2; i < iters; i++) {
         uint64_t t0 = k3_now_ns();
-        if (op.impl) k3_opt_run(&g, &op); else k3_ref_run(&g, &op);
+        if (op.impl == 5) k3_f16_run(&g, &op); else if (op.impl) k3_opt_run(&g, &op); else k3_ref_run(&g, &op);
         if (i >= 0) t[i] = k3_now_ns() - t0;
     }
     if (g_check) check_op(&g, &op, 0);
@@ -964,6 +1003,22 @@ static int cmd_ddpm(int argc, char **argv)
     return 0;
 }
 
+/* peak resident set (VmHWM) and the loaded blobs, for the memory footprint */
+static void print_mem(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    long hwm = -1, rss = -1;
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "VmHWM:", 6)) hwm = strtol(line + 6, NULL, 10);
+            if (!strncmp(line, "VmRSS:", 6)) rss = strtol(line + 6, NULL, 10);
+        }
+        fclose(f);
+    }
+    printf("MEM vmhwm_kb=%ld vmrss_kb=%ld\n", hwm, rss);
+}
+
 static int dispatch(int argc, char **argv) __attribute__((noinline));
 static int dispatch(int argc, char **argv)
 {
@@ -989,6 +1044,7 @@ static void *main_thread(void *arg)
         return NULL;
     }
     g_rc = dispatch(g_argc, g_argv);
+    print_mem();
     return NULL;
 }
 

@@ -24,9 +24,11 @@ sys.path.insert(0, str(HERE.parent / "gpu_eval" / "harness"))
 from mbir import cuda_dtypes, load_ir  # noqa: E402
 
 from modelblaster.pipeline import int8_mixed as M  # noqa: E402
+import f16_ir  # noqa: E402  (per-tensor storage: fp16 outputs rounded once; fp32 IRs walk as before)
 
 S8 = {"quantize_rows_s8", "linear_dq_s8", "linear3_dq_s8", "linear_dq_add_s8"}
-NP = {"f32": np.float32, "i8": np.int8, "i32": np.int32, "i64": np.int32, "u8": np.int8, "b8": np.int8}
+NP = {"f32": np.float32, "i8": np.int8, "i32": np.int32, "i64": np.int32, "u8": np.int8, "b8": np.int8,
+      "f16": np.float16}
 
 
 def temb(t, dim=720, lo=4e-3, hi=4.0):
@@ -38,7 +40,7 @@ def temb(t, dim=720, lo=4e-3, hi=4.0):
 def walk_all(ir, inputs: dict) -> dict:
     vals = {k: torch.as_tensor(v) for k, v in inputs.items()}
     rec = lambda n, v: vals.__setitem__(n, v.detach().clone())
-    M.walk(ir, M.inputs_of(ir, [inputs[n] for n in ir_input_names(ir)]), record=rec)
+    f16_ir.walk(ir, M.inputs_of(ir, [inputs[n] for n in ir_input_names(ir)]), record=rec)
     return vals
 
 
@@ -96,9 +98,9 @@ def cmd_compare(a):
     z = np.load(a.ref)
     dump = read_dump(a.dump)
     tid = {n: i for i, n in enumerate(names["tensors"])}
-    tol = cuda_dtypes.TOLERANCE["fp32"]
+    tols = {"f32": cuda_dtypes.TOLERANCE["fp32"], "f16": cuda_dtypes.TOLERANCE["fp16"]}
     s8_bad, f32_bad, worst, first = {}, 0, 0.0, None
-    by_kind = {}
+    by_kind, exact = {}, {}
     for op in ir.ops:
         if op["op"] == "view":
             continue
@@ -111,6 +113,11 @@ def cmd_compare(a):
                 if nb and first is None:
                     first = f"{op['name']} ({op['op']}): {nb} bytes differ"
                 continue
+            tol = tols["f16" if names["dtypes"][t] == "f16" else "f32"]
+            if names["dtypes"][t] == "f16":
+                ex = exact.setdefault(op["op"], [0, 0])
+                ex[0] += int((got.view(np.uint16) != ref.astype(np.float16).view(np.uint16)).sum())
+                ex[1] += got.size
             g, r = got.astype(np.float64), ref.astype(np.float64)
             same = (g == r) | (np.isnan(g) & np.isnan(r))
             d = np.where(same, 0.0, np.abs(g - r))
@@ -131,7 +138,8 @@ def cmd_compare(a):
                     first = f"{op['name']} ({op['op']}) rel_err={e:.2e}"
     res = {"s8_mismatch_bytes_by_kind": s8_bad, "n_fp32_ops_over_slot_bound": f32_bad,
            "worst_fp32_rel_err": worst, "fp32_worst_by_kind": {k: v[1] for k, v in by_kind.items()},
-           "first_divergent": first, "slot_bound": tol,
+           "first_divergent": first, "slot_bound": tols,
+           "f16_elements_differing_from_walk_by_kind": {k: f"{v[0]}/{v[1]}" for k, v in exact.items()},
            "ok": f32_bad == 0 and not any(s8_bad.values())}
     print(json.dumps(res, indent=1))
     if a.json:
