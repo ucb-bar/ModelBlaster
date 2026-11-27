@@ -2504,8 +2504,8 @@ def emit_weights(
         _al = ((ir or {}).get("weight_align") or {}).get(k)
         if k in k3_tiled:
             _al = max(64, int(_al or 0))
-        _attr = f" __attribute__((aligned({int(_al)})))" if _al else ""
-        c_lines.append(f"const {c_type} {ident}[{arr_out.size}]{_attr} = {{")
+        _attr = f"__attribute__((aligned({int(_al)}))) " if _al else ""
+        c_lines.append(f"{_attr}const {c_type} {ident}[{arr_out.size}] = {{")
         if arr_out.dtype == np.float64:
             # repr() round-trips a double exactly
             flat = arr_out.reshape(-1)
